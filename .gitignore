@@ -1,0 +1,89 @@
+# =========================
+# SECRETS / LOCAL SETTINGS
+# =========================
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+secrets/
+**/secrets/
+
+# =========================
+# DATABASES / DUMPS / BACKUPS
+# =========================
+*.db
+*.sqlite
+*.sqlite3
+*.dump
+*.bak
+*.backup
+*.sql
+*.gz
+*.zip
+backups/
+**/backups/
+dump/
+dumps/
+exports/
+*.xlsx
+*.csv
+*.tsv
+
+# =========================
+# PYTHON CACHE / BUILD
+# =========================
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.pycache_tmp/
+.mypy_cache/
+.ruff_cache/
+.pytype/
+.pyre/
+*.log
+logs/
+*.pid
+
+# =========================
+# COVERAGE / TEST ARTIFACTS
+# =========================
+.coverage
+.coverage.*
+htmlcov/
+.nox/
+.tox/
+pytestdebug.log
+*.prof
+
+# =========================
+# VENV
+# =========================
+.venv/
+venv/
+ENV/
+env/
+
+# =========================
+# IDE / OS
+# =========================
+.idea/
+.vscode/
+*.iml
+.DS_Store
+Thumbs.db
+
+# =========================
+# DOCKER LOCAL OVERRIDES
+# =========================
+docker-compose.override.yml
+
+# =========================
+# PROJECT-SPECIFIC (optional)
+# =========================
+# If you ever generate device auths json locally, keep it out of git:
+device_auths*.json
+**/device_auths*.json
