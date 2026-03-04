@@ -1,0 +1,46 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: egs-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: egs_bot
+      POSTGRES_USER: egs_user
+      POSTGRES_PASSWORD: egs_pass
+    ports:
+      - "5432:5432"
+    volumes:
+      - egs_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U egs_user -d egs_bot"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  app:
+    build:
+      context: .
+    container_name: egs-bot
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      # When running in Docker, DB is reachable by service name.
+      DB_URL: postgresql+psycopg://egs_user:egs_pass@postgres:5432/egs_bot
+      APP_MODE: all
+      # Keep safe defaults for production bring-up; change consciously.
+      DRY_RUN: "0"
+      SEND_REQUESTS_ENABLED: "1"
+    volumes:
+      - /tmp:/tmp
+    healthcheck:
+      test: ["CMD-SHELL", "python tools/healthcheck.py --allow-empty >/dev/null 2>&1 || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+volumes:
+  egs_postgres_data:
