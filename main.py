@@ -34,6 +34,15 @@ from epic_api_client import (
     verify_account_health_with_device,
 )
 from epic_device_auth import EpicDeviceAuthGenerator, append_device_auth_to_file
+from campaign_settings import (
+    campaign_ui_label,
+    campaign_ui_num,
+    get_campaign_send_mode,
+    get_campaign_sender_pick_mode,
+    set_campaign_send_mode,
+    set_campaign_sender_pick_mode,
+    target_required_senders as campaign_target_required_senders,
+)
 from db_models import (
     Account,
     Campaign,
@@ -157,6 +166,17 @@ class TaskStatus(Enum):
     CANCELLED = "cancelled"
 
 
+ACTIVE_SEND_TASK_STATUSES = (
+    TaskStatus.QUEUED.value,
+    TaskStatus.POSTPONED.value,
+    TaskStatus.RUNNING.value,
+)
+QUEUED_OR_POSTPONED_TASK_STATUSES = (
+    TaskStatus.QUEUED.value,
+    TaskStatus.POSTPONED.value,
+)
+
+
 TARGET_STATUS_RU = {
     TargetStatus.NEW.value: "новая",
     TargetStatus.PENDING.value: "в ожидании",
@@ -165,6 +185,22 @@ TARGET_STATUS_RU = {
     TargetStatus.REJECTED.value: "отклонено",
     TargetStatus.FAILED.value: "ошибка",
 }
+
+TARGET_SEND_BASE_STATUSES = (
+    TargetStatus.NEW.value,
+    TargetStatus.PENDING.value,
+    TargetStatus.SENT.value,
+)
+TARGET_SEND_REPEAT_EXTRA_STATUSES = (
+    TargetStatus.REJECTED.value,
+    TargetStatus.FAILED.value,
+    TargetStatus.ACCEPTED.value,
+)
+TARGET_RECHECK_ELIGIBLE_STATUSES = (
+    TargetStatus.PENDING.value,
+    TargetStatus.SENT.value,
+    TargetStatus.ACCEPTED.value,
+)
 
 
 def target_status_ru(code: str) -> str:
@@ -366,7 +402,6 @@ def ensure_runtime_settings() -> None:
             "recheck_daily_limit": str(DEFAULT_RECHECK_DAILY_LIMIT),
             "jitter_min_sec": str(DEFAULT_SEND_JITTER_MIN_SEC),
             "jitter_max_sec": str(DEFAULT_SEND_JITTER_MAX_SEC),
-            "sender_dispatch_mode": "sequential",
             "sender_switch_min_sec": "0",
             "sender_switch_max_sec": "0",
         }
@@ -420,6 +455,19 @@ def get_setting_int(db, key: str, default: int) -> int:
 def get_setting_bool(db, key: str, default: bool = False) -> bool:
     val = get_setting(db, key, "1" if default else "0").strip().lower()
     return val in {"1", "true", "yes", "on"}
+
+
+def is_processing_enabled() -> bool:
+    return bool(db_exec(lambda db: get_setting_bool(db, "processing_enabled", True)))
+
+
+def set_processing_enabled(enabled: bool):
+    db_exec(lambda db: set_setting(db, "processing_enabled", "1" if enabled else "0"))
+
+
+def show_processing_status(chat_id: int):
+    enabled = is_processing_enabled()
+    show_menu_status(chat_id, "manage", f"ℹ️ Статус обработки: {'включена' if enabled else 'выключена'}.")
 
 
 def get_runtime_timezone(db) -> ZoneInfo:
@@ -733,20 +781,9 @@ def enforce_api_rate_limit(db, acc: Account, now: datetime, api_cost: int) -> tu
 
 
 def target_required_senders(db, tgt: Target) -> int:
-    """
-    Приоритет:
-    1) target.required_senders (если задано >0)
-    2) settings.target_senders_count
-    3) DEFAULT_TARGET_SENDERS_COUNT
-    """
-    required = int(getattr(tgt, "required_senders", 0) or 0)
-    if required > 0:
-        return required
-    if getattr(tgt, "campaign_id", None):
-        camp = db.query(Campaign).filter(Campaign.id == int(tgt.campaign_id)).first()
-        if camp and camp.name != "Основная" and int(camp.target_senders_count or 0) > 0:
-            return int(camp.target_senders_count)
-    return max(1, get_setting_int(db, "target_senders_count", DEFAULT_TARGET_SENDERS_COUNT))
+    # Compatibility wrapper for existing call sites/tests.
+    fallback = get_setting_int(db, "target_senders_count", DEFAULT_TARGET_SENDERS_COUNT)
+    return campaign_target_required_senders(db, tgt, fallback)
 
 
 def jitter_seconds_with_db(db) -> int:
@@ -1071,13 +1108,7 @@ def create_tasks_for_new_targets(db, limit: int = 500, campaign_id: Optional[int
         db.query(Task.account_id, func.count(Task.id))
         .filter(
             Task.task_type == "send_request",
-            Task.status.in_(
-                [
-                    TaskStatus.QUEUED.value,
-                    TaskStatus.POSTPONED.value,
-                    TaskStatus.RUNNING.value,
-                ]
-            ),
+            Task.status.in_(ACTIVE_SEND_TASK_STATUSES),
         )
         .group_by(Task.account_id)
         .all()
@@ -1101,16 +1132,9 @@ def create_tasks_for_new_targets(db, limit: int = 500, campaign_id: Optional[int
         if camp.name == "Основная":
             repeat_daily = repeat_daily or get_setting_bool(db, "daily_repeat_campaign_enabled", False)
     if repeat_daily:
-        target_statuses = [
-            TargetStatus.NEW.value,
-            TargetStatus.PENDING.value,
-            TargetStatus.SENT.value,
-            TargetStatus.REJECTED.value,
-            TargetStatus.FAILED.value,
-            TargetStatus.ACCEPTED.value,
-        ]
+        target_statuses = list(TARGET_SEND_BASE_STATUSES + TARGET_SEND_REPEAT_EXTRA_STATUSES)
     else:
-        target_statuses = [TargetStatus.NEW.value, TargetStatus.PENDING.value, TargetStatus.SENT.value]
+        target_statuses = list(TARGET_SEND_BASE_STATUSES)
 
     day_start_utc, day_end_utc = local_day_bounds_utc_naive(db, now)
 
@@ -1148,7 +1172,7 @@ def create_tasks_for_new_targets(db, limit: int = 500, campaign_id: Optional[int
             int(x[0]) for x in db.query(Task.account_id).filter(
                 Task.target_id == t.id,
                 Task.task_type == "send_request",
-                Task.status.in_([TaskStatus.QUEUED.value, TaskStatus.POSTPONED.value, TaskStatus.RUNNING.value]),
+                Task.status.in_(ACTIVE_SEND_TASK_STATUSES),
             ).distinct().all()
         }
         if repeat_daily:
@@ -1206,6 +1230,17 @@ def create_tasks_for_new_targets(db, limit: int = 500, campaign_id: Optional[int
         t = state["target"]
         assigned_accounts = state["assigned"]
         if int(acc.id) in assigned_accounts or int(state["missing"]) <= 0:
+            return False
+        existing_active_pair = db.query(Task.id).filter(
+            Task.task_type == "send_request",
+            Task.target_id == int(t.id),
+            Task.account_id == int(acc.id),
+            Task.status.in_(ACTIVE_SEND_TASK_STATUSES),
+        ).first()
+        if existing_active_pair:
+            if int(acc.id) not in assigned_accounts:
+                assigned_accounts.add(int(acc.id))
+                state["missing"] = max(0, int(state["missing"]) - 1)
             return False
         daily_limit_per_account = default_daily_limit_per_account if campaign_id_for_tasks is not None else max(1, int(acc.daily_limit or DEFAULT_DAILY_LIMIT))
         windows_json = default_windows_json if campaign_id_for_tasks is not None else (acc.active_windows_json or "[]")
@@ -1267,6 +1302,13 @@ def create_tasks_for_new_targets(db, limit: int = 500, campaign_id: Optional[int
         if valid_accs:
             start_idx = int(cursor % len(valid_accs))
             ordered_accs = valid_accs[start_idx:] + valid_accs[:start_idx]
+            sender_pick_mode = (
+                get_campaign_sender_pick_mode(db, int(campaign_id_for_tasks))
+                if campaign_id_for_tasks
+                else "ordered"
+            )
+            if sender_pick_mode == "random":
+                random.shuffle(ordered_accs)
             last_used_shift = 0
             campaign_send_mode = get_campaign_send_mode(db, int(campaign_id_for_tasks or 0)) if campaign_id_for_tasks else "sender_first"
             # Strict layered pacing:
@@ -1393,7 +1435,7 @@ def create_tasks_for_new_targets(db, limit: int = 500, campaign_id: Optional[int
                         db,
                         "warning",
                         f"⚠️ Не хватило уникальных аккаунтов для цели {t.username} "
-                        f"(цель #{(campaign_id_for_tasks if campaign_id_for_tasks is not None else 'legacy')}): "
+                        f"(цель #{(campaign_id_for_tasks if campaign_id_for_tasks is not None else 'current')}): "
                         f"нужно {required}, назначено {len(assigned_accounts)}",
                     )
                     break
@@ -1407,7 +1449,7 @@ def create_tasks_for_new_targets(db, limit: int = 500, campaign_id: Optional[int
                 db,
                 "warning",
                 f"⚠️ Не хватило уникальных аккаунтов для цели {t.username} "
-                f"(цель #{(campaign_id_for_tasks if campaign_id_for_tasks is not None else 'legacy')}): "
+                f"(цель #{(campaign_id_for_tasks if campaign_id_for_tasks is not None else 'current')}): "
                 f"нужно {int(state['required'])}, назначено {len(state['assigned'])}",
             )
     db.commit()
@@ -1431,6 +1473,28 @@ def campaign_sent_today_for_account(db, account_id: int, campaign_id: int, now_u
         or 0
     )
 
+
+def rebuild_campaign_send_queue(db, campaign_id: int, create_limit: int = 5000) -> tuple[int, int]:
+    """
+    Remove stale queued/postponed send tasks for a goal and rebuild missing tasks
+    under current goal settings.
+    """
+    dropped_queue = int(
+        db.query(Task)
+        .filter(
+            task_campaign_filter(db, campaign_id),
+            Task.task_type == "send_request",
+            Task.status.in_(QUEUED_OR_POSTPONED_TASK_STATUSES),
+        )
+        .delete(synchronize_session=False)
+        or 0
+    )
+    db.commit()
+    effective_campaign_id = int(campaign_id) if int(campaign_id or 0) > 0 else None
+    created_tasks = int(create_tasks_for_new_targets(db, limit=int(create_limit), campaign_id=effective_campaign_id) or 0)
+    return dropped_queue, created_tasks
+
+
 def process_tasks_job():
     """Обработать очередь задач"""
 
@@ -1440,7 +1504,7 @@ def process_tasks_job():
         processed = 0
         now = utc_now()
         tasks_query = db.query(Task).filter(
-            Task.status.in_([TaskStatus.QUEUED.value, TaskStatus.POSTPONED.value]),
+            Task.status.in_(QUEUED_OR_POSTPONED_TASK_STATUSES),
             Task.scheduled_for <= now
         ).order_by(
             case((Task.task_type == "send_request", 0), else_=1),
@@ -1459,14 +1523,19 @@ def process_tasks_job():
             tgt = db.query(Target).filter(Target.id == task.target_id).first()
             camp_id = int(task.campaign_id or getattr(tgt, "campaign_id", 0) or 0)
             camp = get_campaign_or_default(db, camp_id)
-            legacy_campaign_mode = (camp_id <= 0 and getattr(tgt, "campaign_id", None) in (None, 0) and task.campaign_id in (None, 0))
+            # Compatibility path for old rows without campaign_id.
+            no_campaign_link_mode = (
+                camp_id <= 0
+                and getattr(tgt, "campaign_id", None) in (None, 0)
+                and task.campaign_id in (None, 0)
+            )
             if not acc or not tgt:
                 task.status = TaskStatus.FAILED.value
                 task.last_error = "Account/target missing"
                 task.completed_at = now
                 processed += 1
                 continue
-            if camp is None and not legacy_campaign_mode:
+            if camp is None and not no_campaign_link_mode:
                 task.status = TaskStatus.FAILED.value
                 task.last_error = "campaign_missing"
                 task.completed_at = now
@@ -1526,6 +1595,19 @@ def process_tasks_job():
                 source_tag = str(task.last_error or "").strip().lower()
                 is_recheck_resend = source_tag == "recheck_resend"
                 is_manual_forced_cycle = source_tag == "manual_forced_cycle"
+                older_active_pair = db.query(Task.id).filter(
+                    Task.task_type == "send_request",
+                    Task.target_id == int(tgt.id),
+                    Task.account_id == int(acc.id),
+                    Task.status.in_(ACTIVE_SEND_TASK_STATUSES),
+                    Task.id != int(task.id),
+                ).order_by(Task.id.asc()).first()
+                if older_active_pair and int(older_active_pair[0]) < int(task.id):
+                    task.status = TaskStatus.CANCELLED.value
+                    task.completed_at = now
+                    task.last_error = "duplicate_active_pair_task"
+                    processed += 1
+                    continue
                 if not (is_recheck_resend or is_manual_forced_cycle):
                     done_sender_query = db.query(Task.account_id).filter(
                         Task.target_id == int(tgt.id),
@@ -1758,7 +1840,7 @@ def process_tasks_job():
                     db.query(func.count(Task.id))
                     .filter(
                         Task.task_type == "send_request",
-                        Task.status.in_([TaskStatus.QUEUED.value, TaskStatus.POSTPONED.value]),
+                        Task.status.in_(QUEUED_OR_POSTPONED_TASK_STATUSES),
                         Task.scheduled_for <= now,
                         task_campaign_filter(db, int(camp.id) if camp is not None else 0),
                     )
@@ -1777,7 +1859,7 @@ def process_tasks_job():
                     db.query(func.count(Task.id))
                     .filter(
                         Task.task_type == "send_request",
-                        Task.status.in_([TaskStatus.QUEUED.value, TaskStatus.POSTPONED.value]),
+                        Task.status.in_(QUEUED_OR_POSTPONED_TASK_STATUSES),
                         Task.account_id == int(acc.id),
                         Task.scheduled_for <= now,
                         task_campaign_filter(db, int(camp.id) if camp is not None else 0),
@@ -1853,7 +1935,7 @@ def process_tasks_job():
                                 Task.task_type == "send_request",
                                 Task.account_id == int(acc.id),
                                 Task.target_id == int(tgt.id),
-                                Task.status.in_([TaskStatus.QUEUED.value, TaskStatus.POSTPONED.value, TaskStatus.RUNNING.value]),
+                                Task.status.in_(ACTIVE_SEND_TASK_STATUSES),
                             ).first()
                             if not has_active_send:
                                 jitter_min = max(0, int(camp.jitter_min_sec or DEFAULT_SEND_JITTER_MIN_SEC)) if camp is not None else DEFAULT_SEND_JITTER_MIN_SEC
@@ -2083,6 +2165,18 @@ def _can_use_callback(user_id: int, data: str) -> bool:
     d = str(data or "")
     if d in {"acc_device_auto", "acc_list"}:
         return True
+    if d.startswith("act:"):
+        code = d.split(":", 1)[1]
+        return code in {
+            "acc_list",
+            "acc_device",
+            "acc_prev",
+            "acc_next",
+            "acc_search",
+            "back",
+            "back_main",
+            "main_accounts",
+        }
     return d.startswith("acc_device_cancel:") or d.startswith("acc_device_show_login:") or d.startswith("acc_device_show_pass:")
 
 
@@ -2428,8 +2522,13 @@ def show_screen(
                         reply_markup=edit_markup,
                     )
                     return msg_id
-                except Exception:
-                    pass
+                except Exception as e2:
+                    logger.warning(
+                        "ui_edit_plain_fallback_failed chat_id=%s msg_id=%s err=%s",
+                        chat_id,
+                        msg_id,
+                        str(e2)[:180],
+                    )
             # Если редактирование не удалось, удалим старый экран, чтобы не плодить дубли.
             _safe_delete(chat_id, msg_id)
 
@@ -2521,51 +2620,6 @@ def get_selected_campaign_id(chat_id: int) -> int:
     return fallback
 
 
-def _campaign_send_mode_key(campaign_id: int) -> str:
-    return f"campaign_send_mode_{int(campaign_id)}"
-
-
-def get_campaign_send_mode(db, campaign_id: int) -> str:
-    raw = str(get_setting(db, _campaign_send_mode_key(int(campaign_id)), "sender_first") or "").strip().lower()
-    if raw not in {"sender_first", "target_first"}:
-        return "sender_first"
-    return raw
-
-
-def set_campaign_send_mode(db, campaign_id: int, mode: str):
-    val = str(mode or "").strip().lower()
-    if val not in {"sender_first", "target_first"}:
-        val = "sender_first"
-    set_setting(db, _campaign_send_mode_key(int(campaign_id)), val)
-
-
-def campaign_ui_num(db, campaign_id: int) -> int:
-    """
-    Human-friendly ordinal (1..N) ordered by DB id.
-    """
-    cid = int(campaign_id or 0)
-    if cid <= 0:
-        return 0
-    ids = [int(x[0]) for x in db.query(Campaign.id).order_by(Campaign.id.asc()).all()]
-    try:
-        return ids.index(cid) + 1
-    except ValueError:
-        return 0
-
-
-def campaign_ui_label(db, campaign_id: int) -> str:
-    cid = int(campaign_id or 0)
-    if cid <= 0:
-        return "не выбрана"
-    row = db.query(Campaign.name).filter(Campaign.id == cid).first()
-    if not row:
-        return "не выбрана"
-    num = campaign_ui_num(db, cid)
-    if num > 0:
-        return f"№{num} {row[0]} (id:{cid})"
-    return f"{row[0]} (id:{cid})"
-
-
 def _pop_step_prompt(chat_id: int, user_id: int) -> Optional[int]:
     with STEP_LOCK:
         return STEP_PROMPTS.pop((chat_id, user_id), None)
@@ -2625,109 +2679,192 @@ def kb_senders_pager(target_id: int, page: int, pages: int) -> types.InlineKeybo
     )
     return m
 
-def kb_main_reply() -> types.ReplyKeyboardMarkup:
-    m = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    m.add("👥 Аккаунты", "🎯 Цели")
-    m.add("⚙️ Настройки", "🔧 Управление")
-    m.add("📊 Статистика", "⚠️ Диагностика")
+INLINE_ACTION_TEXT = {
+    "main_accounts": "👥 Аккаунты",
+    "main_targets": "🎯 Цели",
+    "main_settings": "⚙️ Настройки",
+    "main_manage": "🔧 Управление",
+    "main_stats": "📊 Статистика",
+    "main_diag": "⚠️ Диагностика",
+    "back": "⬅️ Назад",
+    "back_main": "🏠 Меню",
+    "acc_import": "📥 Импорт файлов",
+    "acc_list": "📋 Список аккаунтов",
+    "acc_device": "🔐 Авторизация Epic (ссылка)",
+    "acc_check": "✅ Проверить аккаунты",
+    "acc_refresh_names": "🔄 Обновить ники Epic",
+    "acc_add": "➕ Добавить аккаунт",
+    "acc_del": "➖ Удалить аккаунт",
+    "acc_prev": "◀️ Аккаунты",
+    "acc_next": "▶️ Аккаунты",
+    "acc_search": "🔎 Поиск аккаунтов",
+    "targets_manager": "🗂️ Менеджер целей",
+    "targets_stats": "📊 Статистика целей",
+    "targets_start_all": "▶️ Запустить все цели",
+    "targets_stop_all": "⏸️ Остановить все цели",
+    "targets_stop_operation": "⛔ Остановить операцию",
+    "goal_add": "➕ Добавить цель",
+    "goal_list": "📋 Список целей",
+    "goal_select": "🎯 Выбрать цель",
+    "goal_edit": "✏️ Редактировать цель",
+    "goal_progress": "📊 Статистика цели",
+    "goal_import_nicks": "📥 Импорт ников",
+    "goal_nicks": "📋 Ники цели",
+    "goal_nick_statuses": "📄 Статусы по никам",
+    "goal_nick_prev": "◀️ Ники",
+    "goal_nick_next": "▶️ Ники",
+    "goal_nick_search": "🔎 Поиск ников",
+    "goal_add_nick": "➕ Добавить ник",
+    "goal_del_nick": "➖ Удалить ник",
+    "goal_distribute": "🚀 Распределить ники",
+    "goal_senders_for_nick": "👀 Отправители по нику",
+    "goal_senders_prev": "◀️ Отправители",
+    "goal_senders_next": "▶️ Отправители",
+    "goal_force_one": "⚡ Форс-цикл с аккаунта",
+    "goal_force_random": "🎲 Форс-цикл (рандом)",
+    "goal_start": "▶️ Запустить цель",
+    "goal_stop": "⏸️ Остановить цель",
+    "goal_revoke": "↩️ Отозвать заявки",
+    "goal_remove_friends": "🗑️ Удалить из друзей",
+    "goal_delete": "🗑️ Удалить цель",
+    "goal_limit": "🔄 Лимит",
+    "goal_jitter": "⏱️ Джиттер",
+    "goal_windows": "🕐 Окна",
+    "goal_target_limit": "🎯 На ник",
+    "goal_recheck_limit": "🔁 Лимит повторных проверок",
+    "goal_daily_repeat": "📅 Ежедневный повтор",
+    "goal_send_algo": "🔀 Алгоритм отправки",
+    "goal_sender_pick_mode": "🎲 Порядок отправителей",
+    "goal_params": "📋 Параметры цели",
+    "set_api_limits": "🛡️ API лимиты",
+    "set_proxy": "📌 Прокси",
+    "set_auth_access": "👤 Доступ auth",
+    "auth_add": "➕ Добавить ID auth",
+    "auth_del": "➖ Удалить ID auth",
+    "auth_list": "📋 Список ID auth",
+    "auth_clear": "🗑 Очистить ID auth",
+    "manage_tick": "▶️ Тик (1 раз)",
+    "manage_export": "📤 Экспорт",
+    "manage_stop": "⏸️ Стоп обработки",
+    "manage_start": "▶️ Старт обработки",
+    "manage_status": "📍 Статус обработки",
+    "proxy_add": "➕ Добавить прокси",
+    "proxy_list": "📋 Список прокси",
+    "proxy_del": "🗑️ Удалить прокси",
+}
+
+
+def _act(code: str) -> str:
+    return f"act:{code}"
+
+
+def _act_btn(code: str) -> types.InlineKeyboardButton:
+    return types.InlineKeyboardButton(INLINE_ACTION_TEXT[code], callback_data=_act(code))
+
+
+def kb_main_reply() -> types.InlineKeyboardMarkup:
+    m = types.InlineKeyboardMarkup(row_width=2)
+    m.add(_act_btn("main_accounts"), _act_btn("main_targets"))
+    m.add(_act_btn("main_settings"), _act_btn("main_manage"))
+    m.add(_act_btn("main_stats"), _act_btn("main_diag"))
     return m
 
 
-def kb_auth_operator_reply() -> types.ReplyKeyboardMarkup:
-    m = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    m.add("📋 Список аккаунтов", "🔐 Авторизация Epic (ссылка)")
-    m.add("◀️ Акк", "▶️ Акк", "🔎 Акк поиск")
-    m.add("🏠 Меню")
+def kb_auth_operator_reply() -> types.InlineKeyboardMarkup:
+    m = types.InlineKeyboardMarkup(row_width=2)
+    m.add(_act_btn("acc_list"), _act_btn("acc_device"))
+    m.add(_act_btn("acc_prev"), _act_btn("acc_next"))
+    m.add(_act_btn("acc_search"))
+    m.add(_act_btn("back_main"))
     return m
 
 
-def kb_accounts_reply() -> types.ReplyKeyboardMarkup:
-    m = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    m.add("📥 Импорт файлов", "📋 Список аккаунтов")
-    m.add("🔐 Авторизация Epic (ссылка)", "✅ Проверить аккаунты")
-    m.add("🔄 Обновить ники Epic")
-    m.add("➕ Добавить аккаунт", "➖ Удалить аккаунт")
-    m.add("◀️ Акк", "▶️ Акк", "🔎 Акк поиск")
-    m.add("⬅️ Назад")
+def kb_accounts_reply() -> types.InlineKeyboardMarkup:
+    m = types.InlineKeyboardMarkup(row_width=2)
+    m.add(_act_btn("acc_import"), _act_btn("acc_list"))
+    m.add(_act_btn("acc_device"), _act_btn("acc_check"))
+    m.add(_act_btn("acc_refresh_names"))
+    m.add(_act_btn("acc_add"), _act_btn("acc_del"))
+    m.add(_act_btn("acc_prev"), _act_btn("acc_next"))
+    m.add(_act_btn("acc_search"))
+    m.add(_act_btn("back"))
     return m
 
 
-def kb_targets_reply() -> types.ReplyKeyboardMarkup:
-    m = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    m.add("🗂️ Менеджер целей", "📊 Статистика целей")
-    m.add("▶️ Запустить все цели", "⏸️ Остановить все цели")
-    m.add("⛔ Остановить операцию")
-    m.add("⬅️ Назад")
+def kb_targets_reply() -> types.InlineKeyboardMarkup:
+    m = types.InlineKeyboardMarkup(row_width=2)
+    m.add(_act_btn("targets_manager"), _act_btn("targets_stats"))
+    m.add(_act_btn("targets_start_all"), _act_btn("targets_stop_all"))
+    m.add(_act_btn("targets_stop_operation"))
+    m.add(_act_btn("back"))
     return m
 
 
-def kb_goal_manager_reply() -> types.ReplyKeyboardMarkup:
-    m = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    m.add("➕ Добавить цель", "📋 Список целей")
-    m.add("🎯 Выбрать цель", "⬅️ Назад")
+def kb_goal_manager_reply() -> types.InlineKeyboardMarkup:
+    m = types.InlineKeyboardMarkup(row_width=2)
+    m.add(_act_btn("goal_add"), _act_btn("goal_list"))
+    m.add(_act_btn("goal_select"))
+    m.add(_act_btn("back"))
     return m
 
 
-def kb_goal_selected_reply() -> types.ReplyKeyboardMarkup:
-    m = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    m.add("✏️ Редактировать цель", "📊 Статистика цели")
-    m.add("📥 Импорт ников", "📋 Ники цели")
-    m.add("📄 Статусы по никам")
-    m.add("◀️ Ники", "▶️ Ники", "🔎 Поиск ников")
-    m.add("➕ Добавить ник", "➖ Удалить ник")
-    m.add("🚀 Распределить ники", "👀 Отправители по нику")
-    m.add("⚡ Форс-цикл с аккаунта")
-    m.add("▶️ Запустить цель", "⏸️ Остановить цель")
-    m.add("↩️ Отозвать заявки", "🗑️ Удалить из друзей")
-    m.add("⛔ Остановить операцию")
-    m.add("🗑️ Удалить цель", "⬅️ Назад")
+def kb_goal_selected_reply() -> types.InlineKeyboardMarkup:
+    m = types.InlineKeyboardMarkup(row_width=2)
+    m.add(_act_btn("goal_edit"), _act_btn("goal_progress"))
+    m.add(_act_btn("goal_import_nicks"), _act_btn("goal_nicks"))
+    m.add(_act_btn("goal_nick_statuses"))
+    m.add(_act_btn("goal_nick_prev"), _act_btn("goal_nick_next"))
+    m.add(_act_btn("goal_nick_search"))
+    m.add(_act_btn("goal_add_nick"), _act_btn("goal_del_nick"))
+    m.add(_act_btn("goal_distribute"), _act_btn("goal_senders_for_nick"))
+    m.add(_act_btn("goal_senders_prev"), _act_btn("goal_senders_next"))
+    m.add(_act_btn("goal_force_one"), _act_btn("goal_force_random"))
+    m.add(_act_btn("goal_start"), _act_btn("goal_stop"))
+    m.add(_act_btn("goal_revoke"), _act_btn("goal_remove_friends"))
+    m.add(_act_btn("targets_stop_operation"))
+    m.add(_act_btn("goal_delete"), _act_btn("back"))
     return m
 
 
-def kb_goal_edit_reply() -> types.ReplyKeyboardMarkup:
-    m = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    m.add("🔄 Лимит", "⏱️ Джиттер")
-    m.add("🕐 Окна", "🎯 На ник")
-    m.add("🔁 Лимит повторных проверок", "📅 Ежедневный повтор")
-    m.add("🔀 Алгоритм отправки", "📋 Параметры цели")
-    m.add("⬅️ Назад")
+def kb_goal_edit_reply() -> types.InlineKeyboardMarkup:
+    m = types.InlineKeyboardMarkup(row_width=2)
+    m.add(_act_btn("goal_limit"), _act_btn("goal_jitter"))
+    m.add(_act_btn("goal_windows"), _act_btn("goal_target_limit"))
+    m.add(_act_btn("goal_recheck_limit"), _act_btn("goal_daily_repeat"))
+    m.add(_act_btn("goal_send_algo"), _act_btn("goal_sender_pick_mode"))
+    m.add(_act_btn("goal_params"))
+    m.add(_act_btn("back"))
+    return m
+
+def kb_settings_reply() -> types.InlineKeyboardMarkup:
+    m = types.InlineKeyboardMarkup(row_width=2)
+    m.add(_act_btn("set_api_limits"), _act_btn("set_proxy"))
+    m.add(_act_btn("set_auth_access"))
+    m.add(_act_btn("back"))
     return m
 
 
-def kb_campaigns_reply() -> types.ReplyKeyboardMarkup:
-    # Backward-compatible alias for old function name.
-    return kb_goal_manager_reply()
-
-
-def kb_settings_reply() -> types.ReplyKeyboardMarkup:
-    m = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    m.add("🛡️ API лимиты", "📌 Прокси")
-    m.add("👤 Доступ auth")
-    m.add("⬅️ Назад")
+def kb_auth_access_reply() -> types.InlineKeyboardMarkup:
+    m = types.InlineKeyboardMarkup(row_width=2)
+    m.add(_act_btn("auth_add"), _act_btn("auth_del"))
+    m.add(_act_btn("auth_list"), _act_btn("auth_clear"))
+    m.add(_act_btn("back"))
     return m
 
 
-def kb_auth_access_reply() -> types.ReplyKeyboardMarkup:
-    m = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    m.add("➕ Добавить ID auth", "➖ Удалить ID auth")
-    m.add("📋 Список ID auth", "🗑 Очистить ID auth")
-    m.add("⬅️ Назад")
+def kb_manage_reply() -> types.InlineKeyboardMarkup:
+    m = types.InlineKeyboardMarkup(row_width=2)
+    m.add(_act_btn("manage_tick"), _act_btn("manage_export"))
+    m.add(_act_btn("manage_stop"), _act_btn("manage_start"))
+    m.add(_act_btn("manage_status"))
+    m.add(_act_btn("back"))
     return m
 
 
-def kb_manage_reply() -> types.ReplyKeyboardMarkup:
-    m = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    m.add("▶️ Тик (1 раз)", "📤 Экспорт")
-    m.add("⏸️ Стоп обработки", "▶️ Старт обработки")
-    m.add("📍 Статус обработки")
-    m.add("⬅️ Назад")
-    return m
-
-
-def kb_proxy_reply() -> types.ReplyKeyboardMarkup:
-    m = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    m.add("➕ Добавить прокси", "📋 Список прокси")
-    m.add("🗑️ Удалить прокси", "⬅️ Назад")
+def kb_proxy_reply() -> types.InlineKeyboardMarkup:
+    m = types.InlineKeyboardMarkup(row_width=2)
+    m.add(_act_btn("proxy_add"), _act_btn("proxy_list"))
+    m.add(_act_btn("proxy_del"), _act_btn("back"))
     return m
 
 
@@ -2773,7 +2910,7 @@ def show_stats_screen(chat_id: int):
     show_screen(chat_id, text, reply_markup=kb_main_reply(), parse_mode="Markdown", force_new=True)
 
 def show_main_menu(chat_id: int):
-    # Главное меню (reply keyboard).
+    # Главное меню (inline keyboard).
     cancel_all_step_prompts(chat_id)
     set_current_menu(chat_id, "home")
     show_screen(
@@ -2927,14 +3064,14 @@ def show_diagnostics_screen(chat_id: int):
 
     def _inner(db):
         accs = db.query(Account).order_by(Account.id.asc()).all()
-        tasks_queued = db.query(Task).filter(Task.status.in_([TaskStatus.QUEUED.value, TaskStatus.POSTPONED.value])).count()
+        tasks_queued = db.query(Task).filter(Task.status.in_(QUEUED_OR_POSTPONED_TASK_STATUSES)).count()
         tasks_send_active = db.query(Task).filter(
             Task.task_type == "send_request",
-            Task.status.in_([TaskStatus.QUEUED.value, TaskStatus.POSTPONED.value, TaskStatus.RUNNING.value]),
+            Task.status.in_(ACTIVE_SEND_TASK_STATUSES),
         ).count()
         tasks_check_active = db.query(Task).filter(
             Task.task_type == "check_status",
-            Task.status.in_([TaskStatus.QUEUED.value, TaskStatus.POSTPONED.value, TaskStatus.RUNNING.value]),
+            Task.status.in_(ACTIVE_SEND_TASK_STATUSES),
         ).count()
 
         targets_by_status = dict(db.query(Target.status, func.count(Target.id)).group_by(Target.status).all())
@@ -3056,6 +3193,7 @@ def show_menu_status(chat_id: int, menu_key: str, status_text: str):
     menus = {
         "accounts": ("👥 Управление аккаунтами", kb_accounts_reply),
         "targets": ("🎯 Цели", kb_targets_reply),
+        "goal_manager": ("🗂️ Менеджер целей", kb_goal_manager_reply),
         "goal_selected": ("🎯 Текущая цель", kb_goal_selected_reply),
         "goal_edit": ("✏️ Редактирование цели", kb_goal_edit_reply),
         "settings": ("⚙️ Настройки", kb_settings_reply),
@@ -3275,7 +3413,7 @@ def show_targets_receiver_stats(chat_id: int, page: int = 1, query: str = ""):
                 .filter(
                     Task.target_id.in_(ids),
                     Task.task_type == "send_request",
-                    Task.status.in_([TaskStatus.QUEUED.value, TaskStatus.POSTPONED.value, TaskStatus.RUNNING.value]),
+                    Task.status.in_(ACTIVE_SEND_TASK_STATUSES),
                 )
                 .group_by(Task.target_id)
                 .all()
@@ -3285,7 +3423,7 @@ def show_targets_receiver_stats(chat_id: int, page: int = 1, query: str = ""):
                 .filter(
                     Task.target_id.in_(ids),
                     Task.task_type == "check_status",
-                    Task.status.in_([TaskStatus.QUEUED.value, TaskStatus.POSTPONED.value, TaskStatus.RUNNING.value]),
+                    Task.status.in_(ACTIVE_SEND_TASK_STATUSES),
                 )
                 .group_by(Task.target_id)
                 .all()
@@ -3431,7 +3569,7 @@ def show_campaign_progress(chat_id: int, with_campaign_info: bool = False):
             .filter(
                 task_campaign_filter(db, selected_campaign_id),
                 Task.task_type == "send_request",
-                Task.status.in_([TaskStatus.QUEUED.value, TaskStatus.POSTPONED.value, TaskStatus.RUNNING.value]),
+                Task.status.in_(ACTIVE_SEND_TASK_STATUSES),
             )
             .scalar()
             or 0
@@ -3441,7 +3579,7 @@ def show_campaign_progress(chat_id: int, with_campaign_info: bool = False):
             .filter(
                 task_campaign_filter(db, selected_campaign_id),
                 Task.task_type == "check_status",
-                Task.status.in_([TaskStatus.QUEUED.value, TaskStatus.POSTPONED.value, TaskStatus.RUNNING.value]),
+                Task.status.in_(ACTIVE_SEND_TASK_STATUSES),
             )
             .scalar()
             or 0
@@ -3500,7 +3638,7 @@ def show_campaign_progress(chat_id: int, with_campaign_info: bool = False):
         default_required = max(1, get_setting_int(db, "target_senders_count", DEFAULT_TARGET_SENDERS_COUNT))
         campaign_id = int(camp.id) if camp else 0
         campaign_num = campaign_ui_num(db, campaign_id) if camp else 0
-        camp_name = camp.name if camp else "legacy"
+        camp_name = camp.name if camp else "Текущая"
         return (
             campaign_id,
             campaign_num,
@@ -3549,7 +3687,7 @@ def show_campaign_progress(chat_id: int, with_campaign_info: bool = False):
         if campaign_id > 0:
             title = f"📈 Прогресс цели №{campaign_num} {camp_name} (id:{campaign_id})"
         else:
-            title = "📈 Прогресс текущей цели (legacy)"
+            title = "📈 Прогресс текущей цели"
         empty_lines = [title, "Ники получателя пока не загружены."]
         if with_campaign_info:
             with SessionLocal() as db:
@@ -3581,7 +3719,7 @@ def show_campaign_progress(chat_id: int, with_campaign_info: bool = False):
     title = (
         f"📈 Прогресс цели №{campaign_num} {camp_name} (id:{campaign_id})"
         if campaign_id > 0
-        else "📈 Прогресс текущей цели (legacy)"
+        else "📈 Прогресс текущей цели"
     )
     lines = [
         title,
@@ -3641,7 +3779,7 @@ def cmd_start(message):
 def cmd_stop_relationship_action(message):
     running = stop_relationship_action(message.chat.id)
     if running:
-        show_menu_status(message.chat.id, "targets", "⏳ Команда остановки отправлена. Операция завершится на ближайшем шаге.")
+        show_menu_status(message.chat.id, "targets", "⏳ Остановка операции принята. Завершу на ближайшем шаге.")
     else:
         show_menu_status(message.chat.id, "targets", "ℹ️ Сейчас нет активной операции отзыва/удаления.")
 
@@ -3672,218 +3810,229 @@ def cmd_clean(message):
     show_main_menu(chat_id)
 
 
-@bot.message_handler(func=lambda m: bool(getattr(m, "text", None)))
-@user_access_only
-def cmd_reply_nav(message):
-    text = (message.text or "").strip()
-    chat_id = message.chat.id
-    current_menu = get_current_menu(chat_id)
-    full_admin = is_admin(message.from_user.id)
-
-    if not full_admin:
-        # Auth-operator mode: only auth-related account actions.
-        if text in {"🏠 Меню", "Меню", "⬅️ Назад", "⬅️ Главное меню", "⬅️ В главное меню"}:
-            show_auth_operator_menu(chat_id)
-            return
-        if text == "📋 Список аккаунтов":
-            cb_acc_list(py_types.SimpleNamespace(id="reply", data="acc_list", from_user=message.from_user, message=message))
-            return
-        if text == "🔐 Авторизация Epic (ссылка)":
-            cb_acc_device_auto(py_types.SimpleNamespace(id="reply", data="acc_device_auto", from_user=message.from_user, message=message))
-            return
-        if text in {"◀️ Акк", "◀ Акк"}:
-            page = get_chat_ui_int(chat_id, "acc_page", 1) - 1
-            query = str(get_chat_ui_value(chat_id, "acc_query", "") or "")
-            show_accounts_list(chat_id, page=page, query=query)
-            return
-        if text in {"▶️ Акк", "▶ Акк"}:
-            page = get_chat_ui_int(chat_id, "acc_page", 1) + 1
-            query = str(get_chat_ui_value(chat_id, "acc_query", "") or "")
-            show_accounts_list(chat_id, page=page, query=query)
-            return
-        if text == "🔎 Акк поиск":
-            ask_step(
-                message,
-                "Введи часть логина (пусто = сброс):",
-                handle_accounts_search_query,
-            )
-            return
-        show_auth_operator_menu(chat_id)
+@bot.callback_query_handler(func=lambda call: str(getattr(call, "data", "")).startswith("act:"))
+@admin_only_call
+def cb_inline_action_nav(call):
+    _safe_answer_callback(call)
+    data = str(call.data or "")
+    code = data.split(":", 1)[1] if ":" in data else ""
+    text = INLINE_ACTION_TEXT.get(code)
+    if not text:
         return
 
-    if text == "⬅️ Назад":
-        if current_menu == "accounts":
-            show_main_menu(chat_id)
-            return
-        if current_menu == "targets":
-            show_main_menu(chat_id)
-            return
-        if current_menu == "goal_manager":
-            show_targets_menu(chat_id)
-            return
-        if current_menu == "goal_selected":
-            show_goal_manager_menu(chat_id)
-            return
-        if current_menu == "goal_edit":
-            show_selected_goal_menu(chat_id)
-            return
-        if current_menu == "settings":
-            show_main_menu(chat_id)
-            return
-        if current_menu == "auth_access":
-            show_settings_menu(chat_id)
-            return
-        if current_menu == "manage":
-            show_main_menu(chat_id)
-            return
-        if current_menu == "proxy":
-            show_settings_menu(chat_id)
-            return
-        show_main_menu(chat_id)
-        return
+    fake_message = py_types.SimpleNamespace(
+        chat=call.message.chat,
+        from_user=call.from_user,
+        text=text,
+        message_id=getattr(call.message, "message_id", None),
+    )
+    cmd_reply_nav(fake_message)
 
-    # Main navigation
-    if text in {"⬅️ Главное меню", "⬅️ В главное меню", "🏠 Меню", "Меню"}:
-        show_main_menu(chat_id)
-        return
-    if text == "📊 Статистика":
-        show_stats_screen(chat_id)
-        return
-    if text == "👥 Аккаунты":
-        show_accounts_menu(chat_id)
-        return
-    if text == "🎯 Цели":
-        show_targets_menu(chat_id)
-        return
-    if text == "⚙️ Настройки":
-        show_settings_menu(chat_id)
-        return
-    if text == "🔧 Управление":
-        show_manage_menu(chat_id)
-        return
-    if text == "⚠️ Диагностика":
-        show_diagnostics_screen(chat_id)
-        return
 
-    # Accounts
-    if text == "📥 Импорт файлов":
-        show_menu_status(chat_id, "accounts", "📥 Пришли .xlsx/.txt/.csv файлом в чат.")
-        return
-    if text == "📋 Список аккаунтов":
-        cb_acc_list(py_types.SimpleNamespace(id="reply", data="acc_list", from_user=message.from_user, message=message))
-        return
-    if text == "⬅️ Аккаунты":
-        show_accounts_menu(chat_id)
-        return
-    if text in {"◀️ Акк", "◀ Акк"}:
+def _reply_call_from_message(message, data: str):
+    return py_types.SimpleNamespace(id="reply", data=data, from_user=message.from_user, message=message)
+
+
+def _invoke_reply_callback(message, data: str, handler):
+    handler(_reply_call_from_message(message, data))
+
+
+def _invoke_reply_callback_by_text(message, text: str, mapping: dict[str, tuple[str, object]]) -> bool:
+    item = mapping.get(str(text or "").strip())
+    if not item:
+        return False
+    data, handler = item
+    _invoke_reply_callback(message, data, handler)
+    return True
+
+
+def _invoke_show_menu_by_text(chat_id: int, text: str, mapping: dict[str, object]) -> bool:
+    fn = mapping.get(str(text or "").strip())
+    if not fn:
+        return False
+    fn(chat_id)
+    return True
+
+
+def _handle_accounts_pager_and_search(message, text: str, chat_id: int) -> bool:
+    if text == "◀️ Аккаунты":
         page = get_chat_ui_int(chat_id, "acc_page", 1) - 1
         query = str(get_chat_ui_value(chat_id, "acc_query", "") or "")
         show_accounts_list(chat_id, page=page, query=query)
-        return
-    if text in {"▶️ Акк", "▶ Акк"}:
+        return True
+    if text == "▶️ Аккаунты":
         page = get_chat_ui_int(chat_id, "acc_page", 1) + 1
         query = str(get_chat_ui_value(chat_id, "acc_query", "") or "")
         show_accounts_list(chat_id, page=page, query=query)
-        return
-    if text == "🔎 Акк поиск":
+        return True
+    if text == "🔎 Поиск аккаунтов":
         ask_step(
             message,
             "Введи часть логина (пусто = сброс):",
             handle_accounts_search_query,
         )
-        return
-    if text == "✅ Проверить аккаунты":
-        cb_acc_verify(py_types.SimpleNamespace(id="reply", data="acc_verify", from_user=message.from_user, message=message))
-        return
-    if text == "🔄 Обновить ники Epic":
-        cb_acc_refresh_names(py_types.SimpleNamespace(id="reply", data="acc_refresh_names", from_user=message.from_user, message=message))
-        return
-    if text == "🔐 Авторизация Epic (ссылка)":
-        cb_acc_device_auto(py_types.SimpleNamespace(id="reply", data="acc_device_auto", from_user=message.from_user, message=message))
-        return
-    if text == "➕ Добавить аккаунт":
-        ask_step(
-            message,
-            "Добавление аккаунта-отправителя.\nФормат: login:password",
-            handle_add_account_single,
-        )
-        return
-    if text == "➖ Удалить аккаунт":
-        ask_step(
-            message,
-            "Введи ID или login для удаления.\nМожно списком: по одному в строке или через , ;",
-            handle_delete_account_single,
-        )
-        return
+        return True
+    return False
 
-    # Targets / Goals
-    if text == "🗂️ Менеджер целей":
-        show_goal_manager_menu(chat_id)
-        return
-    if text == "📊 Статистика целей":
-        show_goals_info_all(chat_id)
-        return
+
+def _handle_auth_operator_nav(message, text: str, chat_id: int, callback_text_map: dict[str, tuple[str, object]]) -> bool:
+    # Auth-operator mode: only auth-related account actions.
+    if text in {"🏠 Меню", "⬅️ Назад"}:
+        show_auth_operator_menu(chat_id)
+        return True
+    if _invoke_reply_callback_by_text(message, text, callback_text_map):
+        return True
+    if _handle_accounts_pager_and_search(message, text, chat_id):
+        return True
+    show_auth_operator_menu(chat_id)
+    return True
+
+
+def _handle_goal_edit_shortcuts(message, text: str, chat_id: int, current_menu: str) -> bool:
+    if current_menu != "goal_edit":
+        return False
+    if text == "🔄 Лимит":
+        cid = get_selected_campaign_id(chat_id)
+        camp_info = db_exec(
+            lambda db: db.query(Campaign.name, Campaign.daily_limit_per_account).filter(Campaign.id == cid).first()
+        )
+        current_limit = int((camp_info[1] if camp_info else 0) or 0)
+        camp_name = (camp_info[0] if camp_info else f"#{cid}")
+        ask_step(
+            message,
+            f"Текущая цель: {camp_name} (#{cid})\n"
+            f"Сейчас лимит: {current_limit}/сутки на 1 аккаунт\n\n"
+            "Введи новый лимит (>=1):",
+            handle_set_goal_daily_limit,
+        )
+        return True
+    if text == "⏱️ Джиттер":
+        cid = get_selected_campaign_id(chat_id)
+        camp_info = db_exec(
+            lambda db: db.query(Campaign.name, Campaign.jitter_min_sec, Campaign.jitter_max_sec).filter(Campaign.id == cid).first()
+        )
+        camp_name = (camp_info[0] if camp_info else f"#{cid}")
+        cur_min = int((camp_info[1] if camp_info else 0) or 0)
+        cur_max = int((camp_info[2] if camp_info else 0) or 0)
+        ask_step(
+            message,
+            f"Текущая цель: {camp_name} (#{cid})\n"
+            f"Сейчас джиттер: {cur_min}-{cur_max} сек\n\n"
+            "Введи новый джиттер: min_sec max_sec",
+            handle_set_goal_jitter,
+        )
+        return True
+    if text == "🕐 Окна":
+        cid = get_selected_campaign_id(chat_id)
+        camp_info = db_exec(
+            lambda db: db.query(Campaign.name, Campaign.active_windows_json).filter(Campaign.id == cid).first()
+        )
+        camp_name = (camp_info[0] if camp_info else f"#{cid}")
+        cur_windows = windows_human(camp_info[1] if camp_info else "[]")
+        ask_step(
+            message,
+            f"Текущая цель: {camp_name} (#{cid})\n"
+            f"Сейчас окна: {cur_windows}\n\n"
+            "Введи окна: `24/7` или несколько строк.\n"
+            "Пример будни/выходные:\n"
+            "`days=1,2,3,4,5 from=12:00 to=20:00`\n"
+            "`days=6,7 from=10:00 to=18:00`",
+            handle_set_goal_windows,
+        )
+        return True
+    if text == "🔀 Алгоритм отправки":
+        cid = get_selected_campaign_id(chat_id)
+        mode_ru = db_exec(
+            lambda db: "Сначала отправитель -> все ники"
+            if get_campaign_send_mode(db, cid) == "sender_first"
+            else "Сначала ник -> все отправители"
+        )
+        ask_step(
+            message,
+            f"Текущая цель: #{cid}\n"
+            f"Текущий алгоритм: {mode_ru}\n\n"
+            "Выбери режим:\n"
+            "1 — сначала отправитель, потом следующий\n"
+            "2 — сначала ник, потом следующий",
+            handle_set_goal_send_mode,
+        )
+        return True
+    if text == "🎲 Порядок отправителей":
+        cid = get_selected_campaign_id(chat_id)
+        mode_ru = db_exec(
+            lambda db: "По порядку (ID аккаунтов)"
+            if get_campaign_sender_pick_mode(db, cid) == "ordered"
+            else "Случайный порядок"
+        )
+        ask_step(
+            message,
+            f"Текущая цель: #{cid}\n"
+            f"Текущий порядок отправителей: {mode_ru}\n\n"
+            "Выбери режим:\n"
+            "1 — по порядку аккаунтов\n"
+            "2 — случайный порядок",
+            handle_set_goal_sender_pick_mode,
+        )
+        return True
+    if text == "📋 Параметры цели":
+        show_selected_goal_params(chat_id)
+        return True
+    return False
+
+
+def _handle_targets_goals_actions(message, text: str, chat_id: int) -> bool:
     if text == "▶️ Запустить все цели":
         total, changed = set_all_goals_enabled(True)
         active_now = db_exec(lambda db: int(db.query(Campaign).filter(Campaign.enabled == True).count()))
         show_menu_status(
             chat_id,
             "targets",
-            f"✅ Команда выполнена.\nАктивные цели: {active_now}/{total}\nИзменено сейчас: {changed}",
+            f"✅ Все цели запущены.\nАктивные цели: {active_now}/{total}\nИзменено: {changed}",
         )
-        return
+        return True
     if text == "⏸️ Остановить все цели":
         total, changed = set_all_goals_enabled(False)
         active_now = db_exec(lambda db: int(db.query(Campaign).filter(Campaign.enabled == True).count()))
         show_menu_status(
             chat_id,
             "targets",
-            f"✅ Команда выполнена.\nАктивные цели: {active_now}/{total}\nИзменено сейчас: {changed}",
+            f"✅ Все цели остановлены.\nАктивные цели: {active_now}/{total}\nИзменено: {changed}",
         )
-        return
-    if text in {"➕ Создать цель", "➕ Добавить цель"}:
+        return True
+    if text == "➕ Добавить цель":
         ask_step(
             message,
             "Создание цели.\nВведи имя:",
             handle_campaign_create_name,
         )
-        return
-    if text == "📋 Список целей":
-        show_campaigns_list(chat_id)
-        return
+        return True
     if text == "🎯 Выбрать цель":
         ask_step(
             message,
             "Введи ID цели из списка:",
             handle_campaign_select,
         )
-        return
-    if text == "📈 Прогресс текущей цели":
-        show_campaign_progress(chat_id)
-        return
+        return True
     if text == "📊 Статистика цели":
         show_campaign_progress(chat_id, with_campaign_info=True)
-        return
-    if text == "✏️ Редактировать цель":
-        show_goal_edit_menu(chat_id)
-        return
+        return True
     if text == "🗑️ Удалить цель":
         ask_step(
             message,
             "Введи ID цели для удаления (или текущий ID).\nВнимание: будут удалены её ники и задачи.",
             handle_delete_goal_single,
         )
-        return
+        return True
     if text == "⏸️ Остановить цель":
         cid = get_selected_campaign_id(chat_id)
         ok, msg = _set_campaign_enabled(cid, False)
         show_menu_status(chat_id, "targets", ("✅ " + msg) if ok else ("❌ " + msg))
-        return
+        return True
     if text == "▶️ Запустить цель":
         cid = get_selected_campaign_id(chat_id)
         ok, msg = _set_campaign_enabled(cid, True)
         show_menu_status(chat_id, "targets", ("✅ " + msg) if ok else ("❌ " + msg))
-        return
+        return True
     if text == "↩️ Отозвать заявки":
         ask_step(
             message,
@@ -3891,7 +4040,7 @@ def cmd_reply_nav(message):
             "Введи: ОТОЗВАТЬ",
             handle_revoke_requests_confirm,
         )
-        return
+        return True
     if text == "🗑️ Удалить из друзей":
         ask_step(
             message,
@@ -3899,45 +4048,52 @@ def cmd_reply_nav(message):
             "Введи: УДАЛИТЬ",
             handle_remove_friends_confirm,
         )
-        return
-    if text in {"⛔ Остановить операцию", "⛔️ Остановить операцию", "Стоп операция"}:
+        return True
+    if text == "⛔ Остановить операцию":
         running = stop_relationship_action(chat_id)
         if running:
-            show_menu_status(chat_id, "targets", "⏳ Команда остановки отправлена. Операция завершится на ближайшем шаге.")
+            show_menu_status(chat_id, "targets", "⏳ Остановка операции принята. Завершу на ближайшем шаге.")
         else:
             show_menu_status(chat_id, "targets", "ℹ️ Сейчас нет активной операции отзыва/удаления.")
-        return
-    if text == "📥 Импорт ников":
-        cb_tgt_import(py_types.SimpleNamespace(id="reply", data="tgt_import", from_user=message.from_user, message=message))
-        return
-    if text == "📋 Ники цели":
-        cb_tgt_status(py_types.SimpleNamespace(id="reply", data="tgt_status", from_user=message.from_user, message=message))
-        return
+        return True
     if text == "📄 Статусы по никам":
         query = str(get_chat_ui_value(chat_id, "tgt_query", "") or "")
         page = get_chat_ui_int(chat_id, "tgt_page", 1)
         show_targets_receiver_stats(chat_id, page=page, query=query)
-        return
-    if text in {"◀️ Ники", "◀ Ники"}:
+        return True
+    if text == "◀️ Ники":
         page = get_chat_ui_int(chat_id, "tgt_page", 1) - 1
         query = str(get_chat_ui_value(chat_id, "tgt_query", "") or "")
         show_targets_status(chat_id, page=page, query=query)
-        return
-    if text in {"▶️ Ники", "▶ Ники"}:
+        return True
+    if text == "▶️ Ники":
         page = get_chat_ui_int(chat_id, "tgt_page", 1) + 1
         query = str(get_chat_ui_value(chat_id, "tgt_query", "") or "")
         show_targets_status(chat_id, page=page, query=query)
-        return
+        return True
+    if text == "◀️ Отправители":
+        target_id = int(get_chat_ui_int(chat_id, "senders_target_id", 0))
+        if target_id <= 0:
+            show_menu_status(chat_id, "targets", "ℹ️ Сначала открой «👀 Отправители по нику».")
+            return True
+        page = get_chat_ui_int(chat_id, "senders_page", 1) - 1
+        show_target_senders_page(chat_id, target_id=target_id, page=page)
+        return True
+    if text == "▶️ Отправители":
+        target_id = int(get_chat_ui_int(chat_id, "senders_target_id", 0))
+        if target_id <= 0:
+            show_menu_status(chat_id, "targets", "ℹ️ Сначала открой «👀 Отправители по нику».")
+            return True
+        page = get_chat_ui_int(chat_id, "senders_page", 1) + 1
+        show_target_senders_page(chat_id, target_id=target_id, page=page)
+        return True
     if text == "🔎 Поиск ников":
         ask_step(
             message,
             "Введи часть ника получателя (пусто = сброс):",
             handle_targets_search_query,
         )
-        return
-    if text == "🚀 Распределить ники":
-        cb_tgt_distribute(py_types.SimpleNamespace(id="reply", data="tgt_distribute", from_user=message.from_user, message=message))
-        return
+        return True
     if text == "🧹 Очистить все цели":
         ask_step(
             message,
@@ -3945,112 +4101,42 @@ def cmd_reply_nav(message):
             "Для подтверждения введи: ОЧИСТИТЬ",
             handle_clear_all_targets_confirm,
         )
-        return
+        return True
     if text == "➕ Добавить ник":
         ask_step(
             message,
             "Добавление ника получателя.\nВведи ник:",
             handle_add_target_single,
         )
-        return
+        return True
     if text == "➖ Удалить ник":
         ask_step(
             message,
             "Введи ID ника или ник.\nМожно списком: по одному в строке или через , ;",
             handle_delete_target_single,
         )
-        return
+        return True
     if text == "👀 Отправители по нику":
         ask_step(
             message,
             "Покажу отправителей для ника получателя.\nВведи ID или ник:",
             handle_show_target_senders,
         )
-        return
+        return True
     if text == "⚡ Форс-цикл с аккаунта":
         ask_step(
             message,
             "Введи ID аккаунта-отправителя для одного цикла по всем никам текущей цели:",
             handle_force_cycle_account,
         )
-        return
+        return True
+    if text == "🎲 Форс-цикл (рандом)":
+        handle_force_cycle_random(message)
+        return True
+    return False
 
-    # Goal edit shortcuts (parameters of selected goal)
-    if get_current_menu(chat_id) == "goal_edit":
-        if text == "🔄 Лимит":
-            cid = get_selected_campaign_id(chat_id)
-            camp_info = db_exec(
-                lambda db: db.query(Campaign.name, Campaign.daily_limit_per_account).filter(Campaign.id == cid).first()
-            )
-            current_limit = int((camp_info[1] if camp_info else 0) or 0)
-            camp_name = (camp_info[0] if camp_info else f"#{cid}")
-            ask_step(
-                message,
-                f"Текущая цель: {camp_name} (#{cid})\n"
-                f"Сейчас лимит: {current_limit}/сутки на 1 аккаунт\n\n"
-                "Введи новый лимит (>=1):",
-                handle_set_goal_daily_limit,
-            )
-            return
-        if text == "⏱️ Джиттер":
-            cid = get_selected_campaign_id(chat_id)
-            camp_info = db_exec(
-                lambda db: db.query(Campaign.name, Campaign.jitter_min_sec, Campaign.jitter_max_sec).filter(Campaign.id == cid).first()
-            )
-            camp_name = (camp_info[0] if camp_info else f"#{cid}")
-            cur_min = int((camp_info[1] if camp_info else 0) or 0)
-            cur_max = int((camp_info[2] if camp_info else 0) or 0)
-            ask_step(
-                message,
-                f"Текущая цель: {camp_name} (#{cid})\n"
-                f"Сейчас джиттер: {cur_min}-{cur_max} сек\n\n"
-                "Введи новый джиттер: min_sec max_sec",
-                handle_set_goal_jitter,
-            )
-            return
-        if text == "🕐 Окна":
-            cid = get_selected_campaign_id(chat_id)
-            camp_info = db_exec(
-                lambda db: db.query(Campaign.name, Campaign.active_windows_json).filter(Campaign.id == cid).first()
-            )
-            camp_name = (camp_info[0] if camp_info else f"#{cid}")
-            cur_windows = windows_human(camp_info[1] if camp_info else "[]")
-            ask_step(
-                message,
-                f"Текущая цель: {camp_name} (#{cid})\n"
-                f"Сейчас окна: {cur_windows}\n\n"
-                "Введи окна: `24/7` или несколько строк.\n"
-                "Пример будни/выходные:\n"
-                "`days=1,2,3,4,5 from=12:00 to=20:00`\n"
-                "`days=6,7 from=10:00 to=18:00`",
-                handle_set_goal_windows,
-            )
-            return
-        if text == "🔀 Алгоритм отправки":
-            cid = get_selected_campaign_id(chat_id)
-            mode_ru = db_exec(
-                lambda db: "Сначала отправитель -> все ники"
-                if get_campaign_send_mode(db, cid) == "sender_first"
-                else "Сначала ник -> все отправители"
-            )
-            ask_step(
-                message,
-                f"Текущая цель: #{cid}\n"
-                f"Текущий алгоритм: {mode_ru}\n\n"
-                "Выбери режим:\n"
-                "1 — сначала отправитель, потом следующий\n"
-                "2 — сначала ник, потом следующий",
-                handle_set_goal_send_mode,
-            )
-            return
-        if text == "📋 Параметры цели":
-            show_selected_goal_params(chat_id)
-            return
 
-    # Settings
-    if text == "🎯 На ник":
-        cb_set_target_senders(py_types.SimpleNamespace(id="reply", data="set_target_senders", from_user=message.from_user, message=message))
-        return
+def _handle_settings_and_manage_actions(message, text: str, chat_id: int) -> bool:
     if text == "🛡️ API лимиты":
         cur = db_exec(
             lambda db: (
@@ -4071,27 +4157,27 @@ def cmd_reply_nav(message):
             handle_set_api_limits,
             parse_mode="Markdown",
         )
-        return
+        return True
     if text == "👤 Доступ auth":
         show_auth_access_menu(chat_id)
-        return
+        return True
     if text == "➕ Добавить ID auth":
         ask_step(
             message,
             "Введи Telegram ID для добавления в доступ auth:",
             handle_auth_operator_add_id,
         )
-        return
+        return True
     if text == "➖ Удалить ID auth":
         ask_step(
             message,
             "Введи Telegram ID для удаления из доступа auth:",
             handle_auth_operator_remove_id,
         )
-        return
+        return True
     if text == "📋 Список ID auth":
         show_auth_access_menu(chat_id)
-        return
+        return True
     if text == "🗑 Очистить ID auth":
         ask_step(
             message,
@@ -4100,49 +4186,180 @@ def cmd_reply_nav(message):
             handle_auth_operator_clear_all_confirm,
             parse_mode="Markdown",
         )
-        return
-    if text == "🔁 Лимит повторных проверок":
-        cb_set_recheck_limit(py_types.SimpleNamespace(id="reply", data="set_recheck_limit", from_user=message.from_user, message=message))
-        return
-    if text == "📅 Ежедневный повтор":
-        cb_set_daily_repeat(py_types.SimpleNamespace(id="reply", data="set_daily_repeat", from_user=message.from_user, message=message))
-        return
+        return True
     if text == "📌 Прокси":
         set_current_menu(chat_id, "proxy")
         show_screen(chat_id, "📌 Прокси", reply_markup=kb_proxy_reply(), parse_mode=None, force_new=True)
+        return True
+    if text == "⏸️ Стоп обработки":
+        set_processing_enabled(False)
+        show_menu_status(chat_id, "manage", "⏸️ Обработка остановлена.")
+        return True
+    if text == "▶️ Старт обработки":
+        set_processing_enabled(True)
+        show_menu_status(chat_id, "manage", "▶️ Обработка запущена.")
+        return True
+    if text == "📍 Статус обработки":
+        show_processing_status(chat_id)
+        return True
+    return False
+
+
+def _handle_accounts_actions(message, text: str, chat_id: int) -> bool:
+    if text == "📥 Импорт файлов":
+        show_menu_status(chat_id, "accounts", "📥 Пришли .xlsx/.txt/.csv файлом в чат.")
+        return True
+    if text == "➕ Добавить аккаунт":
+        ask_step(
+            message,
+            "Добавление аккаунта-отправителя.\nФормат: login:password",
+            handle_add_account_single,
+        )
+        return True
+    if text == "➖ Удалить аккаунт":
+        ask_step(
+            message,
+            "Введи ID или login для удаления.\nМожно списком: по одному в строке или через , ;",
+            handle_delete_account_single,
+        )
+        return True
+    return False
+
+
+def _show_menu_by_current_context(chat_id: int, full_admin: bool, current_menu: str):
+    if not full_admin:
+        show_auth_operator_menu(chat_id)
         return
-    if text == "⬅️ Настройки":
-        show_settings_menu(chat_id)
-        return
-    if text == "➕ Добавить прокси":
-        cb_proxy_add(py_types.SimpleNamespace(id="reply", data="proxy_add", from_user=message.from_user, message=message))
-        return
-    if text == "📋 Список прокси":
-        cb_proxy_list(py_types.SimpleNamespace(id="reply", data="proxy_list", from_user=message.from_user, message=message))
-        return
-    if text == "🗑️ Удалить прокси":
-        cb_proxy_delete(py_types.SimpleNamespace(id="reply", data="proxy_delete", from_user=message.from_user, message=message))
+    fn_map = {
+        "main": show_main_menu,
+        "accounts": show_accounts_menu,
+        "targets": show_targets_menu,
+        "goal_manager": show_goal_manager_menu,
+        "goal_selected": show_selected_goal_menu,
+        "goal_edit": show_goal_edit_menu,
+        "settings": show_settings_menu,
+        "auth_access": show_auth_access_menu,
+        "manage": show_manage_menu,
+        "proxy": lambda cid: show_screen(cid, "📌 Прокси", reply_markup=kb_proxy_reply(), parse_mode=None, force_new=True),
+    }
+    fn = fn_map.get(current_menu, show_main_menu)
+    fn(chat_id)
+
+
+def _dispatch_admin_nav(
+    message,
+    text: str,
+    chat_id: int,
+    current_menu: str,
+    callback_text_map: dict[str, tuple[str, object]],
+    show_menu_text_map: dict[str, object],
+    back_by_menu_map: dict[str, object],
+) -> bool:
+    if _handle_accounts_pager_and_search(message, text, chat_id):
+        return True
+
+    if text == "⬅️ Назад":
+        fn = back_by_menu_map.get(current_menu, show_main_menu)
+        fn(chat_id)
+        return True
+
+    if text == "🏠 Меню":
+        show_main_menu(chat_id)
+        return True
+    if _invoke_show_menu_by_text(chat_id, text, show_menu_text_map):
+        return True
+
+    if _handle_accounts_actions(message, text, chat_id):
+        return True
+    if _invoke_reply_callback_by_text(message, text, callback_text_map):
+        return True
+    if _handle_targets_goals_actions(message, text, chat_id):
+        return True
+    if _handle_goal_edit_shortcuts(message, text, chat_id, current_menu):
+        return True
+    if _handle_settings_and_manage_actions(message, text, chat_id):
+        return True
+
+    return False
+
+
+def _nav_callback_text_map() -> dict[str, tuple[str, object]]:
+    return {
+        "📋 Список аккаунтов": ("acc_list", cb_acc_list),
+        "✅ Проверить аккаунты": ("acc_verify", cb_acc_verify),
+        "🔄 Обновить ники Epic": ("acc_refresh_names", cb_acc_refresh_names),
+        "🔐 Авторизация Epic (ссылка)": ("acc_device_auto", cb_acc_device_auto),
+        "📥 Импорт ников": ("tgt_import", cb_tgt_import),
+        "📋 Ники цели": ("tgt_status", cb_tgt_status),
+        "🚀 Распределить ники": ("tgt_distribute", cb_tgt_distribute),
+        "🎯 На ник": ("set_target_senders", cb_set_target_senders),
+        "🔁 Лимит повторных проверок": ("set_recheck_limit", cb_set_recheck_limit),
+        "📅 Ежедневный повтор": ("set_daily_repeat", cb_set_daily_repeat),
+        "➕ Добавить прокси": ("proxy_add", cb_proxy_add),
+        "📋 Список прокси": ("proxy_list", cb_proxy_list),
+        "🗑️ Удалить прокси": ("proxy_delete", cb_proxy_delete),
+        "▶️ Тик (1 раз)": ("manage_tick", cb_manage_tick),
+        "📤 Экспорт": ("manage_export", cb_manage_export),
+    }
+
+
+def _nav_show_menu_text_map() -> dict[str, object]:
+    return {
+        "📊 Статистика": show_stats_screen,
+        "👥 Аккаунты": show_accounts_menu,
+        "🎯 Цели": show_targets_menu,
+        "⚙️ Настройки": show_settings_menu,
+        "🔧 Управление": show_manage_menu,
+        "⚠️ Диагностика": show_diagnostics_screen,
+        "🗂️ Менеджер целей": show_goal_manager_menu,
+        "📊 Статистика целей": show_goals_info_all,
+        "📋 Список целей": show_campaigns_list,
+        "✏️ Редактировать цель": show_goal_edit_menu,
+    }
+
+
+def _nav_back_by_menu_map() -> dict[str, object]:
+    return {
+        "accounts": show_main_menu,
+        "targets": show_main_menu,
+        "goal_manager": show_targets_menu,
+        "goal_selected": show_goal_manager_menu,
+        "goal_edit": show_selected_goal_menu,
+        "settings": show_main_menu,
+        "auth_access": show_settings_menu,
+        "manage": show_main_menu,
+        "proxy": show_settings_menu,
+    }
+
+
+@bot.message_handler(func=lambda m: bool(getattr(m, "text", None)))
+@user_access_only
+def cmd_reply_nav(message):
+    text = (message.text or "").strip()
+    chat_id = message.chat.id
+    current_menu = get_current_menu(chat_id)
+    full_admin = is_admin(message.from_user.id)
+    callback_text_map = _nav_callback_text_map()
+    show_menu_text_map = _nav_show_menu_text_map()
+    back_by_menu_map = _nav_back_by_menu_map()
+
+    if not full_admin:
+        if _handle_auth_operator_nav(message, text, chat_id, callback_text_map):
+            return
+
+    if _dispatch_admin_nav(
+        message,
+        text,
+        chat_id,
+        current_menu,
+        callback_text_map,
+        show_menu_text_map,
+        back_by_menu_map,
+    ):
         return
 
-    # Manage
-    if text in {"▶️ Tick", "▶️ Тик (1 раз)"}:
-        cb_manage_tick(py_types.SimpleNamespace(id="reply", data="manage_tick", from_user=message.from_user, message=message))
-        return
-    if text == "📤 Экспорт":
-        cb_manage_export(py_types.SimpleNamespace(id="reply", data="manage_export", from_user=message.from_user, message=message))
-        return
-    if text == "⏸️ Стоп обработки":
-        db_exec(lambda db: set_setting(db, "processing_enabled", "0"))
-        show_menu_status(chat_id, "manage", "⏸️ Обработка остановлена.")
-        return
-    if text == "▶️ Старт обработки":
-        db_exec(lambda db: set_setting(db, "processing_enabled", "1"))
-        show_menu_status(chat_id, "manage", "▶️ Обработка запущена.")
-        return
-    if text == "📍 Статус обработки":
-        enabled = db_exec(lambda db: get_setting_bool(db, "processing_enabled", True))
-        show_menu_status(chat_id, "manage", f"ℹ️ Статус обработки: {'включена' if enabled else 'выключена'}.")
-        return
+    # Fallback: unknown text -> return user to current menu context.
+    _show_menu_by_current_context(chat_id, full_admin, current_menu)
 
 
 def handle_accounts_search_query(message):
@@ -4171,7 +4388,7 @@ def show_campaigns_list(chat_id: int):
 
     items = db_exec(_inner)
     if not items:
-        show_screen(chat_id, "Целей нет.", reply_markup=kb_campaigns_reply(), parse_mode=None, force_new=True)
+        show_screen(chat_id, "Целей нет.", reply_markup=kb_goal_manager_reply(), parse_mode=None, force_new=True)
         return
     lines = ["📊 Статистика целей:"]
     for idx, c, targets_cnt in items:
@@ -4180,7 +4397,7 @@ def show_campaigns_list(chat_id: int):
             f"№{idx} {c.name} (id:{c.id}) — {st}, целей={targets_cnt}, "
             f"лимит/акк={c.daily_limit_per_account}, на цель={c.target_senders_count}"
         )
-    show_screen(chat_id, "\n".join(lines), reply_markup=kb_campaigns_reply(), parse_mode=None, force_new=True)
+    show_screen(chat_id, "\n".join(lines), reply_markup=kb_goal_manager_reply(), parse_mode=None, force_new=True)
 
 
 def show_goals_info_all(chat_id: int):
@@ -4207,6 +4424,8 @@ def _format_campaign_info(db, c: Campaign) -> str:
     num = campaign_ui_num(db, int(c.id))
     mode = get_campaign_send_mode(db, int(c.id))
     mode_ru = "Сначала отправитель -> все ники" if mode == "sender_first" else "Сначала ник -> все отправители"
+    sender_pick_mode = get_campaign_sender_pick_mode(db, int(c.id))
+    sender_pick_ru = "По порядку (ID аккаунтов)" if sender_pick_mode == "ordered" else "Случайный порядок"
     return (
         f"📄 Цель №{num}: {c.name} (id:{c.id})\n"
         f"Статус: {'активна' if c.enabled else 'остановлена'}\n"
@@ -4216,6 +4435,7 @@ def _format_campaign_info(db, c: Campaign) -> str:
         f"Окна: {windows_human(c.active_windows_json or '[]')}\n"
         f"Джиттер: {c.jitter_min_sec}-{c.jitter_max_sec} сек\n"
         f"Алгоритм: {mode_ru}\n"
+        f"Порядок отправителей: {sender_pick_ru}\n"
         f"Лимит повторных проверок: {c.recheck_daily_limit}\n"
         f"Ежедневный повтор: {'включен' if c.daily_repeat_enabled else 'выключен'}"
     )
@@ -4225,7 +4445,7 @@ def handle_campaign_create_name(message):
     cleanup_step(message)
     name = (message.text or "").strip()
     if not name:
-        show_screen(message.chat.id, "❌ Имя не может быть пустым.", reply_markup=kb_campaigns_reply(), parse_mode=None, force_new=True)
+        show_screen(message.chat.id, "❌ Имя не может быть пустым.", reply_markup=kb_goal_manager_reply(), parse_mode=None, force_new=True)
         return
     key = (message.chat.id, message.from_user.id)
     CAMPAIGN_WIZARD_STATE[key] = {"name": name}
@@ -4245,7 +4465,7 @@ def handle_campaign_create_daily_limit(message):
         if val < 1:
             raise ValueError()
     except Exception:
-        show_screen(message.chat.id, "❌ Нужен положительный лимит.", reply_markup=kb_campaigns_reply(), parse_mode=None, force_new=True)
+        show_screen(message.chat.id, "❌ Нужен положительный лимит.", reply_markup=kb_goal_manager_reply(), parse_mode=None, force_new=True)
         CAMPAIGN_WIZARD_STATE.pop(key, None)
         return
     st["daily_limit_per_account"] = val
@@ -4266,7 +4486,7 @@ def handle_campaign_create_senders(message):
         if val < 1:
             raise ValueError()
     except Exception:
-        show_screen(message.chat.id, "❌ Нужны число >= 1.", reply_markup=kb_campaigns_reply(), parse_mode=None, force_new=True)
+        show_screen(message.chat.id, "❌ Нужны число >= 1.", reply_markup=kb_goal_manager_reply(), parse_mode=None, force_new=True)
         CAMPAIGN_WIZARD_STATE.pop(key, None)
         return
     st["target_senders_count"] = val
@@ -4292,7 +4512,7 @@ def handle_campaign_create_windows(message):
         try:
             st["active_windows_json"] = json.dumps(parse_windows_text(raw), ensure_ascii=False)
         except Exception as e:
-            show_screen(message.chat.id, f"❌ Ошибка окна: {e}", reply_markup=kb_campaigns_reply(), parse_mode=None, force_new=True)
+            show_screen(message.chat.id, f"❌ Ошибка окна: {e}", reply_markup=kb_goal_manager_reply(), parse_mode=None, force_new=True)
             CAMPAIGN_WIZARD_STATE.pop(key, None)
             return
     CAMPAIGN_WIZARD_STATE[key] = st
@@ -4312,7 +4532,7 @@ def handle_campaign_create_recheck(message):
         if val < 0:
             raise ValueError()
     except Exception:
-        show_screen(message.chat.id, "❌ Нужен лимит повторных проверок >= 0.", reply_markup=kb_campaigns_reply(), parse_mode=None, force_new=True)
+        show_screen(message.chat.id, "❌ Нужен лимит повторных проверок >= 0.", reply_markup=kb_goal_manager_reply(), parse_mode=None, force_new=True)
         CAMPAIGN_WIZARD_STATE.pop(key, None)
         return
     st["recheck_daily_limit"] = val
@@ -4330,7 +4550,7 @@ def handle_campaign_create_repeat(message):
     st = CAMPAIGN_WIZARD_STATE.pop(key, None) or {}
     raw = (message.text or "").strip().lower()
     if raw not in {"0", "1", "yes", "no", "true", "false"}:
-        show_screen(message.chat.id, "❌ Введи 1 или 0.", reply_markup=kb_campaigns_reply(), parse_mode=None, force_new=True)
+        show_screen(message.chat.id, "❌ Введи 1 или 0.", reply_markup=kb_goal_manager_reply(), parse_mode=None, force_new=True)
         return
     st["daily_repeat_enabled"] = raw in {"1", "yes", "true"}
 
@@ -4353,19 +4573,19 @@ def handle_campaign_create_repeat(message):
         db.commit()
         db.refresh(c)
         set_campaign_send_mode(db, int(c.id), "sender_first")
+        set_campaign_sender_pick_mode(db, int(c.id), "ordered")
         return int(c.id), None
 
     cid, err = db_exec(_inner)
     if err:
-        show_screen(message.chat.id, f"❌ {err}", reply_markup=kb_campaigns_reply(), parse_mode=None, force_new=True)
+        show_screen(message.chat.id, f"❌ {err}", reply_markup=kb_goal_manager_reply(), parse_mode=None, force_new=True)
         return
     set_chat_ui_value(message.chat.id, "selected_campaign_id", int(cid))
     show_menu_status(
         message.chat.id,
-        "targets",
+        "goal_selected",
         f"✅ Цель создана и остановлена.\nТеперь она выбрана в интерфейсе: id:{cid}.",
     )
-    show_selected_goal_menu(message.chat.id)
 
 
 def handle_campaign_select(message):
@@ -4373,17 +4593,16 @@ def handle_campaign_select(message):
     try:
         cid = int((message.text or "").strip())
     except Exception:
-        show_screen(message.chat.id, "❌ Нужен числовой ID.", reply_markup=kb_campaigns_reply(), parse_mode=None, force_new=True)
+        show_screen(message.chat.id, "❌ Нужен числовой ID.", reply_markup=kb_goal_manager_reply(), parse_mode=None, force_new=True)
         return
     def _inner(db):
         return db.query(Campaign).filter(Campaign.id == cid).first()
     c = db_exec(_inner)
     if not c:
-        show_screen(message.chat.id, "❌ Цель не найдена.", reply_markup=kb_campaigns_reply(), parse_mode=None, force_new=True)
+        show_screen(message.chat.id, "❌ Цель не найдена.", reply_markup=kb_goal_manager_reply(), parse_mode=None, force_new=True)
         return
     set_chat_ui_value(message.chat.id, "selected_campaign_id", int(c.id))
-    show_menu_status(message.chat.id, "targets", f"✅ Выбрана цель #{c.id}: {c.name}")
-    show_selected_goal_menu(message.chat.id)
+    show_menu_status(message.chat.id, "goal_selected", f"✅ Выбрана цель #{c.id}: {c.name}")
 
 
 def _set_campaign_enabled(cid: int, enabled: bool) -> tuple[bool, str]:
@@ -4413,7 +4632,7 @@ def handle_set_goal_daily_limit(message):
     def _inner(db):
         camp = get_campaign_or_default(db, cid)
         if not camp:
-            return False, 0, ""
+            return False, 0, "", 0, 0
         prev = int(camp.daily_limit_per_account or 0)
         camp.daily_limit_per_account = int(limit)
         # Apply new per-goal daily limit immediately (do not wait next day cache rollover).
@@ -4421,14 +4640,19 @@ def handle_set_goal_daily_limit(message):
         set_setting(db, f"camp_daily_limit_val_{int(camp.id)}", str(int(limit)))
         camp.updated_at = utc_now()
         db.commit()
-        return True, prev, camp.name
+        dropped_queue, created_tasks = rebuild_campaign_send_queue(db, int(camp.id), create_limit=5000)
+        return True, prev, camp.name, dropped_queue, created_tasks
 
-    ok, prev, camp_name = db_exec(_inner)
+    ok, prev, camp_name, dropped_queue, created_tasks = db_exec(_inner)
     if ok:
         show_menu_status(
             message.chat.id,
             "targets",
-            f"✅ Лимит цели «{camp_name}» обновлён:\nБыло: {prev}/сутки\nСтало: {limit}/сутки на 1 аккаунт",
+            f"✅ Лимит цели «{camp_name}» обновлён:\n"
+            f"Было: {prev}/сутки\n"
+            f"Стало: {limit}/сутки на 1 аккаунт\n"
+            f"Очищено старых задач: {dropped_queue}\n"
+            f"Добавлено недостающих задач: {created_tasks}",
         )
     else:
         show_menu_status(message.chat.id, "targets", "❌ Цель не найдена")
@@ -4451,23 +4675,26 @@ def handle_set_goal_jitter(message):
     def _inner(db):
         camp = get_campaign_or_default(db, cid)
         if not camp:
-            return False, 0, 0, ""
+            return False, 0, 0, "", 0, 0
         prev_min = int(camp.jitter_min_sec or 0)
         prev_max = int(camp.jitter_max_sec or 0)
         camp.jitter_min_sec = int(mn)
         camp.jitter_max_sec = int(mx)
         camp.updated_at = utc_now()
         db.commit()
-        return True, prev_min, prev_max, camp.name
+        dropped_queue, created_tasks = rebuild_campaign_send_queue(db, int(camp.id), create_limit=5000)
+        return True, prev_min, prev_max, camp.name, dropped_queue, created_tasks
 
-    ok, prev_min, prev_max, camp_name = db_exec(_inner)
+    ok, prev_min, prev_max, camp_name, dropped_queue, created_tasks = db_exec(_inner)
     if ok:
         show_menu_status(
             message.chat.id,
             "targets",
             f"✅ Джиттер цели «{camp_name}» обновлён:\n"
             f"Было: {prev_min}-{prev_max} сек\n"
-            f"Стало: {mn}-{mx} сек",
+            f"Стало: {mn}-{mx} сек\n"
+            f"Очищено старых задач: {dropped_queue}\n"
+            f"Добавлено недостающих задач: {created_tasks}",
         )
     else:
         show_menu_status(message.chat.id, "targets", "❌ Цель не найдена")
@@ -4490,21 +4717,24 @@ def handle_set_goal_windows(message):
     def _inner(db):
         camp = get_campaign_or_default(db, cid)
         if not camp:
-            return False, "[]", ""
+            return False, "[]", "", 0, 0
         prev = camp.active_windows_json or "[]"
         camp.active_windows_json = windows_json
         camp.updated_at = utc_now()
         db.commit()
-        return True, prev, camp.name
+        dropped_queue, created_tasks = rebuild_campaign_send_queue(db, int(camp.id), create_limit=5000)
+        return True, prev, camp.name, dropped_queue, created_tasks
 
-    ok, prev, camp_name = db_exec(_inner)
+    ok, prev, camp_name, dropped_queue, created_tasks = db_exec(_inner)
     if ok:
         show_menu_status(
             message.chat.id,
             "targets",
             f"✅ Окна цели «{camp_name}» обновлены:\n"
             f"Было: {windows_human(prev)}\n"
-            f"Стало: {windows_human(windows_json)}",
+            f"Стало: {windows_human(windows_json)}\n"
+            f"Очищено старых задач: {dropped_queue}\n"
+            f"Добавлено недостающих задач: {created_tasks}",
         )
     else:
         show_menu_status(message.chat.id, "targets", "❌ Цель не найдена")
@@ -4540,8 +4770,111 @@ def handle_set_goal_send_mode(message):
         return
 
     cid = get_selected_campaign_id(message.chat.id)
-    db_exec(lambda db: set_campaign_send_mode(db, cid, mode))
-    show_menu_status(message.chat.id, "targets", f"✅ Алгоритм цели обновлён:\n{mode_ru}")
+    def _inner(db):
+        set_campaign_send_mode(db, cid, mode)
+        return rebuild_campaign_send_queue(db, int(cid), create_limit=5000)
+    dropped_queue, created_tasks = db_exec(_inner)
+    show_menu_status(
+        message.chat.id,
+        "targets",
+        f"✅ Алгоритм цели обновлён:\n{mode_ru}\n"
+        f"Очищено старых задач: {dropped_queue}\n"
+        f"Добавлено недостающих задач: {created_tasks}",
+    )
+
+
+def handle_set_goal_sender_pick_mode(message):
+    cleanup_step(message)
+    raw = str(message.text or "").strip().lower()
+    if raw in {"1", "ordered", "порядок", "по порядку"}:
+        mode = "ordered"
+        mode_ru = "По порядку (ID аккаунтов)"
+    elif raw in {"2", "random", "случайно", "рандом"}:
+        mode = "random"
+        mode_ru = "Случайный порядок"
+    else:
+        show_menu_status(message.chat.id, "targets", "❌ Введи 1 или 2.")
+        return
+
+    cid = get_selected_campaign_id(message.chat.id)
+    def _inner(db):
+        set_campaign_sender_pick_mode(db, cid, mode)
+        return rebuild_campaign_send_queue(db, int(cid), create_limit=5000)
+    dropped_queue, created_tasks = db_exec(_inner)
+    show_menu_status(
+        message.chat.id,
+        "targets",
+        f"✅ Порядок отправителей обновлён:\n{mode_ru}\n"
+        f"Очищено старых задач: {dropped_queue}\n"
+        f"Добавлено недостающих задач: {created_tasks}",
+    )
+
+
+def _create_manual_force_cycle_for_account(db, camp: Campaign, acc: Account) -> dict:
+    targets = (
+        db.query(Target)
+        .filter(target_campaign_filter(db, int(camp.id)))
+        .order_by(Target.id.asc())
+        .all()
+    )
+    if not targets:
+        return {"ok": False, "msg": "В цели нет ников."}
+
+    now = utc_now()
+    jitter_min = max(0, int(camp.jitter_min_sec or DEFAULT_SEND_JITTER_MIN_SEC))
+    jitter_max = max(jitter_min, int(camp.jitter_max_sec or DEFAULT_SEND_JITTER_MAX_SEC))
+    scheduled = now
+    created = 0
+    skipped_active = 0
+    skipped_done = 0
+
+    for t in targets:
+        has_active = db.query(Task.id).filter(
+            Task.task_type == "send_request",
+            Task.campaign_id == int(camp.id),
+            Task.account_id == int(acc.id),
+            Task.target_id == int(t.id),
+            Task.status.in_(ACTIVE_SEND_TASK_STATUSES),
+        ).first()
+        if has_active:
+            skipped_active += 1
+            continue
+
+        already_sent = db.query(Task.id).filter(
+            Task.task_type == "send_request",
+            Task.campaign_id == int(camp.id),
+            Task.account_id == int(acc.id),
+            Task.target_id == int(t.id),
+            Task.status == TaskStatus.DONE.value,
+        ).first()
+        if already_sent:
+            skipped_done += 1
+            continue
+
+        db.add(
+            Task(
+                task_type="send_request",
+                status=TaskStatus.QUEUED.value,
+                campaign_id=int(camp.id),
+                account_id=int(acc.id),
+                target_id=int(t.id),
+                scheduled_for=scheduled,
+                max_attempts=int(t.max_attempts or 3),
+                last_error="manual_forced_cycle",
+            )
+        )
+        created += 1
+        scheduled = scheduled + timedelta(seconds=random.randint(int(jitter_min), int(jitter_max)))
+
+    db.commit()
+    return {
+        "ok": True,
+        "created": int(created),
+        "skipped_active": int(skipped_active),
+        "skipped_done": int(skipped_done),
+        "targets": int(len(targets)),
+        "camp_name": str(camp.name),
+    }
 
 
 def handle_force_cycle_account(message):
@@ -4566,54 +4899,10 @@ def handle_force_cycle_account(message):
         if not (acc.epic_account_id and acc.device_id and acc.device_secret):
             return {"ok": False, "msg": f"У аккаунта #{account_id} нет device auth."}
 
-        targets = (
-            db.query(Target)
-            .filter(target_campaign_filter(db, int(camp.id)))
-            .order_by(Target.id.asc())
-            .all()
-        )
-        if not targets:
-            return {"ok": False, "msg": "В цели нет ников."}
-
-        now = utc_now()
-        jitter_min = max(0, int(camp.jitter_min_sec or DEFAULT_SEND_JITTER_MIN_SEC))
-        jitter_max = max(jitter_min, int(camp.jitter_max_sec or DEFAULT_SEND_JITTER_MAX_SEC))
-        scheduled = now
-        created = 0
-        skipped_active = 0
-        for t in targets:
-            has_active = db.query(Task.id).filter(
-                Task.task_type == "send_request",
-                Task.campaign_id == int(camp.id),
-                Task.account_id == int(acc.id),
-                Task.target_id == int(t.id),
-                Task.status.in_([TaskStatus.QUEUED.value, TaskStatus.POSTPONED.value, TaskStatus.RUNNING.value]),
-            ).first()
-            if has_active:
-                skipped_active += 1
-                continue
-            db.add(
-                Task(
-                    task_type="send_request",
-                    status=TaskStatus.QUEUED.value,
-                    campaign_id=int(camp.id),
-                    account_id=int(acc.id),
-                    target_id=int(t.id),
-                    scheduled_for=scheduled,
-                    max_attempts=int(t.max_attempts or 3),
-                    last_error="manual_forced_cycle",
-                )
-            )
-            created += 1
-            scheduled = scheduled + timedelta(seconds=random.randint(int(jitter_min), int(jitter_max)))
-        db.commit()
-        return {
-            "ok": True,
-            "created": int(created),
-            "skipped_active": int(skipped_active),
-            "targets": int(len(targets)),
-            "camp_name": str(camp.name),
-        }
+        result = _create_manual_force_cycle_for_account(db, camp, acc)
+        if result.get("ok"):
+            result["account_id"] = int(acc.id)
+        return result
 
     res = db_exec(_inner)
     if not res.get("ok"):
@@ -4627,7 +4916,77 @@ def handle_force_cycle_account(message):
         f"Аккаунт: #{account_id}\n"
         f"Всего ников: {res['targets']}\n"
         f"Создано задач: {res['created']}\n"
-        f"Пропущено (уже в очереди): {res['skipped_active']}",
+        f"Пропущено (уже в очереди): {res['skipped_active']}\n"
+        f"Пропущено (уже отправлял): {res.get('skipped_done', 0)}",
+    )
+
+
+def handle_force_cycle_random(message):
+    chat_id = message.chat.id
+    cid = get_selected_campaign_id(chat_id)
+
+    def _inner(db):
+        camp = get_campaign_or_default(db, cid)
+        if not camp:
+            return {"ok": False, "msg": "Цель не найдена."}
+
+        candidate_ids = []
+        accs = (
+            db.query(Account)
+            .filter(
+                Account.enabled == True,
+                Account.status == AccountStatus.ACTIVE.value,
+                Account.epic_account_id.isnot(None),
+                Account.device_id.isnot(None),
+                Account.device_secret.isnot(None),
+            )
+            .order_by(Account.id.asc())
+            .all()
+        )
+        for acc in accs:
+            has_pending_any = db.query(Task.id).filter(
+                Task.task_type == "send_request",
+                Task.campaign_id == int(camp.id),
+                Task.account_id == int(acc.id),
+                Task.status.in_(ACTIVE_SEND_TASK_STATUSES),
+            ).first()
+            if has_pending_any:
+                continue
+            candidate_ids.append(int(acc.id))
+
+        if not candidate_ids:
+            return {"ok": False, "msg": "Нет доступных аккаунтов для рандомного форс-цикла."}
+
+        random.shuffle(candidate_ids)
+        chosen = None
+        for aid in candidate_ids:
+            acc = db.query(Account).filter(Account.id == int(aid)).first()
+            result = _create_manual_force_cycle_for_account(db, camp, acc)
+            if result.get("ok") and int(result.get("created", 0)) > 0:
+                result["account_id"] = int(aid)
+                return result
+            if chosen is None:
+                chosen = result
+
+        if chosen and chosen.get("ok"):
+            chosen["account_id"] = int(candidate_ids[0])
+            return chosen
+        return {"ok": False, "msg": "Не удалось запланировать форс-цикл."}
+
+    res = db_exec(_inner)
+    if not res.get("ok"):
+        show_menu_status(chat_id, "targets", f"❌ {res.get('msg', 'Ошибка форс-цикла.')}")
+        return
+    show_menu_status(
+        chat_id,
+        "targets",
+        f"✅ Форс-цикл (рандом) запланирован.\n"
+        f"Цель: {res['camp_name']}\n"
+        f"Выбран аккаунт: #{res['account_id']}\n"
+        f"Всего ников: {res['targets']}\n"
+        f"Создано задач: {res['created']}\n"
+        f"Пропущено (уже в очереди): {res['skipped_active']}\n"
+        f"Пропущено (уже отправлял): {res.get('skipped_done', 0)}",
     )
 
 
@@ -4656,11 +5015,12 @@ def handle_delete_goal_single(message):
         return True, f"Цель #{cid} удалена"
 
     ok, text = db_exec(_inner)
-    show_menu_status(message.chat.id, "targets", ("✅ " + text) if ok else ("❌ " + text))
     if ok:
         next_cid = db_exec(lambda db: (db.query(Campaign.id).order_by(Campaign.id.asc()).first() or (0,))[0])
         set_chat_ui_value(message.chat.id, "selected_campaign_id", int(next_cid or 0))
-        show_goal_manager_menu(message.chat.id)
+        show_menu_status(message.chat.id, "goal_manager", "✅ " + text)
+    else:
+        show_menu_status(message.chat.id, "targets", "❌ " + text)
 
 
 def handle_clear_all_targets_confirm(message):
@@ -4697,7 +5057,7 @@ def handle_clear_all_targets_confirm(message):
     show_menu_status(
         message.chat.id,
         "targets",
-        f"✅ Полная очистка завершена:\nУдалено целей: {deleted_targets}\nУдалено задач по целям: {deleted_tasks}",
+        f"✅ Полная очистка завершена:\nУдалено ников получателя: {deleted_targets}\nУдалено задач по ним: {deleted_tasks}",
     )
 
 
@@ -5233,7 +5593,7 @@ def handle_import_targets(message):
 
     added, duplicate_in_payload, already_in_db, sample_existing = db_exec(_inner)
     lines = [
-        "✅ Импорт целей завершён",
+        "✅ Импорт ников получателя завершён",
         f"Добавлено: {added}",
         f"Дубликаты в этом списке: {duplicate_in_payload}",
         f"Уже были в базе: {already_in_db}",
@@ -5387,7 +5747,7 @@ def handle_delete_target_single(message):
     show_menu_status(
         message.chat.id,
         "targets",
-        f"✅ Удалено целей: {deleted}" + (f"\nНе найдено: {missing}" if missing else ""),
+        f"✅ Удалено ников получателя: {deleted}" + (f"\nНе найдено: {missing}" if missing else ""),
     )
 
 
@@ -5607,18 +5967,19 @@ def _run_goal_relationship_action(chat_id: int, action: str):
                 if res.ok:
                     ok_count += 1
                     def _save_action(db):
+                        now_ts = utc_now()
                         db.add(
-                        Task(
-                            task_type="revoke_request" if action == "revoke" else "remove_friend",
-                            status=TaskStatus.DONE.value,
-                            campaign_id=int(cid) if int(cid or 0) > 0 else None,
-                            account_id=int(account_id),
-                            target_id=int(target_id),
-                            scheduled_for=utc_now(),
-                            completed_at=utc_now(),
-                            attempt_number=1,
+                            Task(
+                                task_type="revoke_request" if action == "revoke" else "remove_friend",
+                                status=TaskStatus.DONE.value,
+                                campaign_id=int(cid) if int(cid or 0) > 0 else None,
+                                account_id=int(account_id),
+                                target_id=int(target_id),
+                                scheduled_for=now_ts,
+                                completed_at=now_ts,
+                                attempt_number=1,
+                            )
                         )
-                    )
                         db.commit()
 
                     db_exec(_save_action)
@@ -5726,7 +6087,7 @@ def cb_tgt_distribute(call):
     if not enabled:
         show_menu_status(chat_id, "targets", "⏸️ Обработка остановлена. Сначала включи «▶️ Старт обработки».")
         return
-    show_menu_status(chat_id, "targets", f"⏳ Распределяю ники в цели #{selected_campaign_id}...")
+    show_menu_status(chat_id, "targets", f"⏳ Распределяю ники получателя в цели #{selected_campaign_id}...")
 
     def _distribute_zero_reason(db, campaign_id: int) -> str:
         tgt_total = int(
@@ -5746,7 +6107,7 @@ def cb_tgt_distribute(call):
             .filter(
                 task_campaign_filter(db, campaign_id),
                 Task.task_type == "send_request",
-                Task.status.in_([TaskStatus.QUEUED.value, TaskStatus.POSTPONED.value, TaskStatus.RUNNING.value]),
+                Task.status.in_(ACTIVE_SEND_TASK_STATUSES),
             )
             .scalar()
             or 0
@@ -5756,7 +6117,7 @@ def cb_tgt_distribute(call):
             .filter(
                 task_campaign_filter(db, campaign_id),
                 Task.task_type == "check_status",
-                Task.status.in_([TaskStatus.QUEUED.value, TaskStatus.POSTPONED.value, TaskStatus.RUNNING.value]),
+                Task.status.in_(ACTIVE_SEND_TASK_STATUSES),
             )
             .scalar()
             or 0
@@ -5778,10 +6139,10 @@ def cb_tgt_distribute(call):
         try:
             created = db_exec(lambda db: create_tasks_for_new_targets(db, limit=1000, campaign_id=selected_campaign_id))
             if created > 0:
-                show_menu_status(chat_id, "targets", f"✅ Создано задач: {created}")
+                show_menu_status(chat_id, "targets", f"✅ Распределение завершено.\nСоздано задач: {created}")
             else:
                 reason_text = db_exec(lambda db: _distribute_zero_reason(db, selected_campaign_id))
-                show_menu_status(chat_id, "targets", "✅ Создано задач: 0\n" + reason_text)
+                show_menu_status(chat_id, "targets", "✅ Распределение завершено.\nСоздано задач: 0\n" + reason_text)
         except Exception as e:
             show_menu_status(chat_id, "targets", f"❌ Ошибка распределения: {e}")
 
@@ -5975,19 +6336,8 @@ def handle_set_target_senders(message):
             .filter(target_campaign_filter(db, selected_campaign_id))
             .update({Target.required_senders: int(count)}, synchronize_session=False)
         )
-        # Drop old queued send tasks so new limit/dispatch logic applies immediately.
-        dropped_queue = (
-            db.query(Task)
-            .filter(
-                task_campaign_filter(db, selected_campaign_id),
-                Task.task_type == "send_request",
-                Task.status.in_([TaskStatus.QUEUED.value, TaskStatus.POSTPONED.value]),
-            )
-            .delete(synchronize_session=False)
-        )
         db.commit()
-        effective_campaign_id = int(selected_campaign_id) if int(selected_campaign_id or 0) > 0 else None
-        created_tasks = create_tasks_for_new_targets(db, limit=5000, campaign_id=effective_campaign_id)
+        dropped_queue, created_tasks = rebuild_campaign_send_queue(db, int(selected_campaign_id), create_limit=5000)
         return int(updated_targets or 0), int(dropped_queue or 0), int(created_tasks or 0)
 
     updated_targets, dropped_queue, created_tasks = db_exec(_inner)
@@ -5996,7 +6346,7 @@ def handle_set_target_senders(message):
         "targets",
         f"✅ На 1 ник получателя: {count} аккаунтов\n"
         f"Цель: #{selected_campaign_id}\n"
-        f"Обновлено целей: {updated_targets}\n"
+        f"Обновлено ников получателя: {updated_targets}\n"
         f"Очищено старых задач: {dropped_queue}\n"
         f"Добавлено недостающих задач: {created_tasks}",
     )
@@ -6059,74 +6409,6 @@ def handle_set_api_limits(message):
         f"• Интервал: {min_interval_sec} сек\n"
         f"• В час: {hourly_limit}\n"
         f"• В сутки: {daily_limit}",
-    )
-
-
-def handle_set_sender_dispatch_mode(message):
-    cleanup_step(message)
-    raw = (message.text or "").strip().lower()
-    if raw in {"1", "sequential", "очередь", "по очереди"}:
-        mode = "sequential"
-        mode_ru = "по очереди"
-    elif raw in {"2", "balanced", "баланс"}:
-        mode = "balanced"
-        mode_ru = "баланс"
-    else:
-        show_menu_status(message.chat.id, "settings", "❌ Неверный выбор. Введи 1 или 2.")
-        return
-
-    db_exec(lambda db: set_setting(db, "sender_dispatch_mode", mode))
-    show_menu_status(message.chat.id, "settings", f"✅ Режим отправки: {mode_ru}")
-
-
-def handle_auth_operator_access_command(message):
-    cleanup_step(message)
-    raw = (message.text or "").strip()
-    if not raw:
-        show_menu_status(message.chat.id, "settings", "❌ Пустая команда.")
-        return
-
-    if raw.lower() == "list":
-        ids = sorted(get_auth_operator_ids())
-        show_menu_status(
-            message.chat.id,
-            "settings",
-            ("📋 ID операторов авторизации: " + (", ".join(str(x) for x in ids) if ids else "пусто")),
-        )
-        return
-
-    op = raw[:1]
-    val = raw[1:].strip() if op in {"+", "-"} else raw
-    try:
-        uid = int(val)
-        if uid <= 0:
-            raise ValueError()
-    except Exception:
-        show_menu_status(message.chat.id, "settings", "❌ Формат: +ID / -ID / list")
-        return
-
-    if is_admin(uid):
-        show_menu_status(message.chat.id, "settings", "ℹ️ Этот ID уже админ, отдельный доступ не нужен.")
-        return
-
-    def _inner(db):
-        ids = _load_auth_operator_ids(db)
-        if op == "+":
-            ids.add(int(uid))
-            _save_auth_operator_ids(db, ids)
-            return "added", sorted(ids)
-        if op == "-":
-            ids.discard(int(uid))
-            _save_auth_operator_ids(db, ids)
-            return "removed", sorted(ids)
-        return "noop", sorted(ids)
-
-    status, ids = db_exec(_inner)
-    action_ru = "добавлен" if status == "added" else "удален" if status == "removed" else "без изменений"
-    show_menu_status(
-        message.chat.id,
-        "settings",
-        f"✅ ID {uid} {action_ru}.\nТекущий список: " + (", ".join(str(x) for x in ids) if ids else "пусто"),
     )
 
 
@@ -6201,152 +6483,6 @@ def handle_auth_operator_clear_all_confirm(message):
 
     db_exec(_inner)
     show_menu_status(message.chat.id, "auth_access", "✅ Список ID auth очищен.")
-
-
-def _intervals_snapshot():
-    return db_exec(
-        lambda db: (
-            get_setting_int(db, "jitter_min_sec", DEFAULT_SEND_JITTER_MIN_SEC),
-            get_setting_int(db, "jitter_max_sec", DEFAULT_SEND_JITTER_MAX_SEC),
-            get_setting_int(db, "sender_switch_min_sec", 0),
-            get_setting_int(db, "sender_switch_max_sec", 0),
-            get_setting_int(db, "min_request_interval_sec", DEFAULT_MIN_REQUEST_INTERVAL_SEC),
-            get_setting_int(db, "max_request_interval_sec", DEFAULT_MAX_REQUEST_INTERVAL_SEC),
-            get_setting_int(db, "hourly_api_limit", DEFAULT_HOURLY_API_LIMIT),
-            get_setting_int(db, "daily_api_limit", DEFAULT_DAILY_API_LIMIT),
-        )
-    )
-
-
-def _derive_sender_switch_bounds(send_min: int, send_max: int) -> tuple[int, int]:
-    """
-    Auto-pause between senders based on send interval.
-    Keep user input simple: no separate switch fields in UI.
-    """
-    smin = max(0, int(send_min))
-    smax = max(smin, int(send_max))
-    # Slightly longer pause between accounts than between requests in one account.
-    sw_min = max(smin, int(smin * 2))
-    sw_max = max(sw_min, int(smax * 3))
-    return sw_min, sw_max
-
-
-def _apply_intervals_profile(send_min: int, send_max: int, switch_min: int | None, switch_max: int | None, api_min: int, api_max: int, api_hour: int, api_day: int):
-    if switch_min is None or switch_max is None:
-        switch_min, switch_max = _derive_sender_switch_bounds(send_min, send_max)
-    def _inner(db):
-        set_setting(db, "jitter_min_sec", str(int(send_min)))
-        set_setting(db, "jitter_max_sec", str(int(send_max)))
-        set_setting(db, "sender_switch_min_sec", str(int(switch_min)))
-        set_setting(db, "sender_switch_max_sec", str(int(switch_max)))
-        set_setting(db, "min_request_interval_sec", str(int(api_min)))
-        set_setting(db, "max_request_interval_sec", str(int(api_max)))
-        set_setting(db, "hourly_api_limit", str(int(api_hour)))
-        set_setting(db, "daily_api_limit", str(int(api_day)))
-
-    db_exec(_inner)
-
-
-def _apply_selected_campaign_jitter_from_settings(chat_id: int) -> tuple[bool, str]:
-    selected_campaign_id = get_selected_campaign_id(chat_id)
-    if int(selected_campaign_id or 0) <= 0:
-        return False, ""
-    send_min, send_max, _, _, _, _, _, _ = _intervals_snapshot()
-
-    def _inner(db):
-        camp = get_campaign_or_default(db, selected_campaign_id)
-        if not camp:
-            return False, ""
-        camp.jitter_min_sec = int(send_min)
-        camp.jitter_max_sec = int(send_max)
-        camp.updated_at = utc_now()
-        name = str(camp.name)
-        db.commit()
-        return True, name
-
-    return db_exec(_inner)
-
-
-def handle_intervals_custom_values(message):
-    cleanup_step(message)
-    try:
-        parts = [int(x) for x in (message.text or "").strip().split()]
-        if len(parts) not in (2, 4):
-            raise ValueError()
-        if len(parts) == 2:
-            send_min, send_max = parts
-            switch_min, switch_max = _derive_sender_switch_bounds(send_min, send_max)
-        else:
-            # Backward-compatible parsing; not shown in UI.
-            send_min, send_max, switch_min, switch_max = parts
-        if send_min < 0 or send_max < send_min or switch_min < 0 or switch_max < switch_min:
-            raise ValueError()
-    except Exception:
-        show_menu_status(message.chat.id, "settings", "❌ Формат: `send_min send_max` (пример: `30 90`)")
-        return
-
-    cur = _intervals_snapshot()
-    _apply_intervals_profile(
-        send_min=send_min,
-        send_max=send_max,
-        switch_min=switch_min,
-        switch_max=switch_max,
-        api_min=cur[4],
-        api_max=cur[5],
-        api_hour=cur[6],
-        api_day=cur[7],
-    )
-    camp_updated, camp_name = _apply_selected_campaign_jitter_from_settings(message.chat.id)
-    extra = f"\nЦель «{camp_name}»: джиттер синхронизирован." if camp_updated else ""
-    show_menu_status(
-        message.chat.id,
-        "settings",
-        f"✅ Применены свои интервалы:\n"
-        f"Заявки: {send_min}-{send_max} сек\n"
-        f"Пауза отправителей: {switch_min}-{switch_max} сек (авто){extra}",
-    )
-
-
-def handle_set_intervals_mode(message):
-    cleanup_step(message)
-    raw = (message.text or "").strip().lower()
-    cur = _intervals_snapshot()
-    api_day = cur[7]
-    if raw in {"1", "медленно", "slow"}:
-        _apply_intervals_profile(90, 180, None, None, 40, 60, 25, api_day)
-        camp_updated, camp_name = _apply_selected_campaign_jitter_from_settings(message.chat.id)
-        cur2 = _intervals_snapshot()
-        extra = f"\nЦель «{camp_name}»: джиттер синхронизирован." if camp_updated else ""
-        show_menu_status(message.chat.id, "settings", f"✅ Пресет: Медленно\nЗаявки: 90-180с, пауза отправителей: {cur2[2]}-{cur2[3]}с (авто), API: 25/час{extra}")
-        return
-    if raw in {"2", "нормально", "normal"}:
-        _apply_intervals_profile(40, 90, None, None, 30, 40, 40, api_day)
-        camp_updated, camp_name = _apply_selected_campaign_jitter_from_settings(message.chat.id)
-        cur2 = _intervals_snapshot()
-        extra = f"\nЦель «{camp_name}»: джиттер синхронизирован." if camp_updated else ""
-        show_menu_status(message.chat.id, "settings", f"✅ Пресет: Нормально\nЗаявки: 40-90с, пауза отправителей: {cur2[2]}-{cur2[3]}с (авто), API: 40/час{extra}")
-        return
-    if raw in {"3", "быстро", "fast"}:
-        _apply_intervals_profile(20, 50, None, None, 20, 30, 70, api_day)
-        camp_updated, camp_name = _apply_selected_campaign_jitter_from_settings(message.chat.id)
-        cur2 = _intervals_snapshot()
-        extra = f"\nЦель «{camp_name}»: джиттер синхронизирован." if camp_updated else ""
-        show_menu_status(message.chat.id, "settings", f"✅ Пресет: Быстро\nЗаявки: 20-50с, пауза отправителей: {cur2[2]}-{cur2[3]}с (авто), API: 70/час{extra}")
-        return
-    if raw in {"4", "свое", "custom"}:
-        ask_step(
-            message,
-            "Введи свои интервалы в стандартной форме:\n"
-            "`send_min send_max`\n"
-            "Где:\n"
-            "send_* — интервал между заявками с 1 аккаунта\n"
-            "Пауза между отправителями рассчитывается автоматически\n"
-            "Пример: `30 90`",
-            handle_intervals_custom_values,
-            parse_mode="Markdown",
-        )
-        return
-    show_menu_status(message.chat.id, "settings", "❌ Введи 1, 2, 3 или 4.")
 
 
 @bot.callback_query_handler(func=lambda call: call.data == "set_recheck_limit")
@@ -6433,17 +6569,23 @@ def handle_set_daily_repeat(message):
 
     def _inner(db):
         camp = get_campaign_or_default(db, selected_campaign_id)
+        dropped_queue = 0
+        created_tasks = 0
         if camp:
             camp.daily_repeat_enabled = bool(enabled)
             camp.updated_at = utc_now()
             db.commit()
+            dropped_queue, created_tasks = rebuild_campaign_send_queue(db, int(camp.id), create_limit=5000)
         set_setting(db, "daily_repeat_campaign_enabled", "1" if enabled else "0")
+        return int(dropped_queue), int(created_tasks)
 
-    db_exec(_inner)
+    dropped_queue, created_tasks = db_exec(_inner)
     show_menu_status(
         message.chat.id,
         "targets",
-        f"✅ Ежедневный повтор: {'включен' if enabled else 'выключен'} (цель #{selected_campaign_id})",
+        f"✅ Ежедневный повтор: {'включен' if enabled else 'выключен'} (цель #{selected_campaign_id})\n"
+        f"Очищено старых задач: {dropped_queue}\n"
+        f"Добавлено недостающих задач: {created_tasks}",
     )
 
 
@@ -6541,7 +6683,6 @@ def cb_manage_tick(call):
     _safe_answer_callback(call)
 
     chat_id = call.message.chat.id
-    show_menu_status(chat_id, "manage", "▶️ Цикл запущен.")
 
     def worker():
         try:
@@ -6557,7 +6698,7 @@ def cb_manage_tick(call):
 @admin_only_call
 def cb_manage_stop(call):
     _safe_answer_callback(call)
-    db_exec(lambda db: set_setting(db, "processing_enabled", "0"))
+    set_processing_enabled(False)
     show_menu_status(call.message.chat.id, "manage", "⏸️ Обработка остановлена.")
 
 
@@ -6565,7 +6706,7 @@ def cb_manage_stop(call):
 @admin_only_call
 def cb_manage_start(call):
     _safe_answer_callback(call)
-    db_exec(lambda db: set_setting(db, "processing_enabled", "1"))
+    set_processing_enabled(True)
     show_menu_status(call.message.chat.id, "manage", "▶️ Обработка запущена.")
 
 
@@ -6573,8 +6714,7 @@ def cb_manage_start(call):
 @admin_only_call
 def cb_manage_status(call):
     _safe_answer_callback(call)
-    enabled = db_exec(lambda db: get_setting_bool(db, "processing_enabled", True))
-    show_menu_status(call.message.chat.id, "manage", f"ℹ️ Статус обработки: {'включена' if enabled else 'выключена'}.")
+    show_processing_status(call.message.chat.id)
 
 
 @bot.callback_query_handler(func=lambda call: call.data == "manage_export")
@@ -6583,7 +6723,6 @@ def cb_manage_export(call):
     _safe_answer_callback(call)
 
     chat_id = call.message.chat.id
-    show_menu_status(chat_id, "manage", "📤 Экспортирую.")
     try:
         filename = export_results_to_excel()
         with open(filename, "rb") as f:
@@ -6636,7 +6775,7 @@ def handle_document(message):
                     )
                 except TypeError:
                     added, skipped, errors = import_targets_from_text(local_path)
-                entity = "целей"
+                entity = "ников получателя"
             elif current_menu == "accounts":
                 added, skipped, errors = import_accounts_from_text(local_path)
                 entity = "аккаунтов"
@@ -6650,7 +6789,7 @@ def handle_document(message):
                     )
                 except TypeError:
                     added, skipped, errors = import_targets_from_text(local_path)
-                entity = "целей"
+                entity = "ников получателя"
 
         if entity == "аккаунтов":
             show_menu_status(
@@ -6662,13 +6801,13 @@ def handle_document(message):
             show_menu_status(
                 message.chat.id,
                 "targets",
-                f"✅ Импорт целей завершён: ➕ {added}, ⏭️ {skipped}, ❌ {errors}",
+                f"✅ Импорт ников получателя завершён: ➕ {added}, ⏭️ {skipped}, ❌ {errors}",
             )
     except Exception as e:
         show_screen(message.chat.id, f"❌ Ошибка импорта: {str(e)[:200]}", parse_mode=None)
 
 def create_tasks_for_new_targets_job():
-    """Scheduler wrapper для распределения новых целей."""
+    """Scheduler wrapper для распределения ников получателя по активным целям."""
     def _inner(db):
         if not get_setting_bool(db, "processing_enabled", True):
             return 0
@@ -6720,7 +6859,7 @@ def create_recheck_tasks_job():
                 .filter(
                     Task.task_type == "send_request",
                     Task.status == TaskStatus.DONE.value,
-                    Target.status.in_([TargetStatus.PENDING.value, TargetStatus.SENT.value, TargetStatus.ACCEPTED.value]),
+                    Target.status.in_(TARGET_RECHECK_ELIGIBLE_STATUSES),
                     or_(Task.campaign_id == camp_id, and_(Task.campaign_id.is_(None), Target.campaign_id == camp_id)),
                 )
                 .order_by(Task.completed_at.desc().nullslast(), Task.id.desc())
@@ -6744,7 +6883,7 @@ def create_recheck_tasks_job():
                     Task.campaign_id == camp_id,
                     Task.account_id == account_id,
                     Task.target_id == target_id,
-                    Task.status.in_([TaskStatus.QUEUED.value, TaskStatus.POSTPONED.value, TaskStatus.RUNNING.value]),
+                    Task.status.in_(ACTIVE_SEND_TASK_STATUSES),
                 ).first()
                 if has_active_check:
                     continue
