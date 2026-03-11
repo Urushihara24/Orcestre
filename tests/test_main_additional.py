@@ -441,6 +441,50 @@ class TestMainAdditional(unittest.TestCase):
 
         fake_q.with_for_update.assert_called()
 
+    def test_process_tasks_cancels_newer_duplicate_active_pair_task(self):
+        m = self.main
+        acc_id = self._create_account()
+        db = m.SessionLocal()
+        try:
+            tgt = m.Target(username="dup_pair_target", status=m.TargetStatus.PENDING.value, priority=100)
+            db.add(tgt)
+            db.commit()
+            db.refresh(tgt)
+
+            older_running = m.Task(
+                task_type="send_request",
+                status=m.TaskStatus.RUNNING.value,
+                account_id=acc_id,
+                target_id=tgt.id,
+                scheduled_for=m.utc_now() - timedelta(minutes=2),
+                started_at=m.utc_now() - timedelta(minutes=1),
+                max_attempts=3,
+            )
+            newer_queued = m.Task(
+                task_type="send_request",
+                status=m.TaskStatus.QUEUED.value,
+                account_id=acc_id,
+                target_id=tgt.id,
+                scheduled_for=m.utc_now() - timedelta(minutes=1),
+                max_attempts=3,
+            )
+            db.add_all([older_running, newer_queued])
+            db.commit()
+            newer_id = int(newer_queued.id)
+        finally:
+            db.close()
+
+        m.process_tasks_job()
+
+        db = m.SessionLocal()
+        try:
+            newer = db.query(m.Task).filter(m.Task.id == newer_id).first()
+            self.assertIsNotNone(newer)
+            self.assertEqual(newer.status, m.TaskStatus.CANCELLED.value)
+            self.assertEqual(newer.last_error, "duplicate_active_pair_task")
+        finally:
+            db.close()
+
     def test_create_recheck_tasks_job_respects_per_goal_daily_limits(self):
         m = self.main
         db = m.SessionLocal()

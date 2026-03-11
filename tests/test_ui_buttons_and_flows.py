@@ -191,6 +191,61 @@ def test_press_all_buttons_smoke(fresh_main, monkeypatch, tmp_path):
     m.cb_manage_export(_call(data="manage_export"))
 
 
+def test_inline_action_router_dispatches_to_text_navigation(fresh_main, monkeypatch):
+    m = fresh_main
+    routed = {}
+    monkeypatch.setattr(
+        m,
+        "cmd_reply_nav",
+        lambda msg: routed.update(
+            {
+                "chat_id": msg.chat.id,
+                "user_id": msg.from_user.id,
+                "text": msg.text,
+            }
+        ),
+        raising=True,
+    )
+    m.cb_inline_action_nav(_call(chat_id=77, user_id=1, data="act:main_accounts"))
+    assert routed == {"chat_id": 77, "user_id": 1, "text": "👥 Аккаунты"}
+
+
+def test_main_keyboards_are_inline(fresh_main):
+    m = fresh_main
+    assert isinstance(m.kb_main_reply(), m.types.InlineKeyboardMarkup)
+    assert isinstance(m.kb_auth_operator_reply(), m.types.InlineKeyboardMarkup)
+    assert isinstance(m.kb_accounts_reply(), m.types.InlineKeyboardMarkup)
+    assert isinstance(m.kb_targets_reply(), m.types.InlineKeyboardMarkup)
+    assert isinstance(m.kb_goal_manager_reply(), m.types.InlineKeyboardMarkup)
+    assert isinstance(m.kb_goal_selected_reply(), m.types.InlineKeyboardMarkup)
+    assert isinstance(m.kb_goal_edit_reply(), m.types.InlineKeyboardMarkup)
+    assert isinstance(m.kb_settings_reply(), m.types.InlineKeyboardMarkup)
+    assert isinstance(m.kb_manage_reply(), m.types.InlineKeyboardMarkup)
+    assert isinstance(m.kb_proxy_reply(), m.types.InlineKeyboardMarkup)
+
+
+def test_inline_action_router_smoke_for_all_action_codes(fresh_main, monkeypatch):
+    m = fresh_main
+    seen = []
+    monkeypatch.setattr(m, "cmd_reply_nav", lambda msg: seen.append(msg.text), raising=True)
+    for code in sorted(m.INLINE_ACTION_TEXT.keys()):
+        m.cb_inline_action_nav(_call(chat_id=1, user_id=1, data=f"act:{code}"))
+    assert set(seen) == set(m.INLINE_ACTION_TEXT.values())
+
+
+def test_auth_operator_act_access_scope(fresh_main):
+    m = fresh_main
+
+    def _seed(db):
+        m.set_setting(db, m.AUTH_OPERATOR_IDS_SETTING_KEY, "77")
+
+    m.db_exec(_seed)
+    assert m._can_use_callback(77, "act:acc_list") is True
+    assert m._can_use_callback(77, "act:acc_device") is True
+    assert m._can_use_callback(77, "act:main_targets") is False
+    assert m._can_use_callback(77, "act:set_api_limits") is False
+
+
 def test_step_handlers_basic_flows(fresh_main, monkeypatch):
     """
     Прогон основных step-хендлеров (без Telegram), чтобы проверить сценарии ввода.
@@ -304,7 +359,7 @@ def test_reply_nav_routes_new_pagination_search_and_progress(fresh_main, monkeyp
     monkeypatch.setattr(
         m,
         "show_campaign_progress",
-        lambda chat_id: called.__setitem__("progress", called["progress"] + 1),
+        lambda *args, **kwargs: called.__setitem__("progress", called["progress"] + 1),
         raising=True,
     )
     monkeypatch.setattr(
@@ -322,13 +377,13 @@ def test_reply_nav_routes_new_pagination_search_and_progress(fresh_main, monkeyp
     m.set_chat_ui_value(chat_id, "tgt_page", 4)
     m.set_chat_ui_value(chat_id, "tgt_query", "nick")
 
-    m.cmd_reply_nav(_msg(chat_id=chat_id, user_id=1, text="◀️ Акк"))
-    m.cmd_reply_nav(_msg(chat_id=chat_id, user_id=1, text="▶️ Акк"))
-    m.cmd_reply_nav(_msg(chat_id=chat_id, user_id=1, text="🔎 Акк поиск"))
+    m.cmd_reply_nav(_msg(chat_id=chat_id, user_id=1, text="◀️ Аккаунты"))
+    m.cmd_reply_nav(_msg(chat_id=chat_id, user_id=1, text="▶️ Аккаунты"))
+    m.cmd_reply_nav(_msg(chat_id=chat_id, user_id=1, text="🔎 Поиск аккаунтов"))
     m.cmd_reply_nav(_msg(chat_id=chat_id, user_id=1, text="◀️ Ники"))
     m.cmd_reply_nav(_msg(chat_id=chat_id, user_id=1, text="▶️ Ники"))
     m.cmd_reply_nav(_msg(chat_id=chat_id, user_id=1, text="🔎 Поиск ников"))
-    m.cmd_reply_nav(_msg(chat_id=chat_id, user_id=1, text="📈 Прогресс текущей цели"))
+    m.cmd_reply_nav(_msg(chat_id=chat_id, user_id=1, text="📊 Статистика цели"))
 
     assert called["acc"] == [(chat_id, 2, "mail"), (chat_id, 4, "mail")]
     assert called["tgt"] == [(chat_id, 3, "nick"), (chat_id, 5, "nick")]
@@ -551,7 +606,7 @@ def test_bulk_delete_accounts_and_targets(fresh_main, monkeypatch):
             text=f"{t1_id}, bulk_target_2; missing_target",
         )
     )
-    assert "Удалено целей: 2" in captured["targets"]
+    assert "Удалено ников получателя: 2" in captured["targets"]
     assert "Не найдено: 1" in captured["targets"]
     remain_tgt = m.db_exec(lambda db: db.query(m.Target).count())
     assert remain_tgt == 0
@@ -739,7 +794,7 @@ def test_clear_all_targets_with_confirmation(fresh_main, monkeypatch):
     assert m.db_exec(lambda db: db.query(m.Target).count()) == 1
 
     m.handle_clear_all_targets_confirm(_msg(text="ОЧИСТИТЬ"))
-    assert "Удалено целей: 1" in captured["text"]
+    assert "Удалено ников получателя: 1" in captured["text"]
     assert m.db_exec(lambda db: db.query(m.Target).count()) == 0
     assert m.db_exec(lambda db: db.query(m.Task).count()) == 0
 
@@ -831,6 +886,116 @@ def test_set_target_senders_updates_existing_targets_and_creates_missing_tasks(f
     assert unique_accounts == 2
 
 
+def test_set_goal_jitter_rebuilds_send_queue_without_stale_tasks(fresh_main, monkeypatch):
+    m = fresh_main
+    monkeypatch.setattr(m, "cleanup_step", lambda *a, **k: None, raising=True)
+    out = {}
+    monkeypatch.setattr(
+        m,
+        "show_menu_status",
+        lambda chat_id, menu_key, status_text: out.update({"menu": menu_key, "text": status_text}),
+        raising=True,
+    )
+
+    def _seed(db):
+        camp = m.Campaign(
+            name="rebuild_jitter_goal",
+            enabled=True,
+            target_senders_count=1,
+            jitter_min_sec=0,
+            jitter_max_sec=0,
+        )
+        db.add(camp)
+        db.flush()
+        a1 = m.Account(
+            login="rj_1@example.com",
+            password="x",
+            enabled=True,
+            status=m.AccountStatus.ACTIVE.value,
+            epic_account_id="e1",
+            device_id="d1",
+            device_secret="s1",
+            daily_limit=100,
+            today_sent=0,
+            active_windows_json="[]",
+        )
+        a2 = m.Account(
+            login="rj_2@example.com",
+            password="x",
+            enabled=True,
+            status=m.AccountStatus.ACTIVE.value,
+            epic_account_id="e2",
+            device_id="d2",
+            device_secret="s2",
+            daily_limit=100,
+            today_sent=0,
+            active_windows_json="[]",
+        )
+        t = m.Target(
+            username="rebuild_jitter_target",
+            campaign_id=int(camp.id),
+            status=m.TargetStatus.NEW.value,
+            required_senders=1,
+        )
+        db.add_all([a1, a2, t])
+        db.flush()
+        # Stale queue tail: 2 queued tasks for target with required_senders=1
+        db.add_all(
+            [
+                m.Task(
+                    task_type="send_request",
+                    status=m.TaskStatus.QUEUED.value,
+                    campaign_id=int(camp.id),
+                    account_id=int(a1.id),
+                    target_id=int(t.id),
+                    scheduled_for=m.utc_now(),
+                    max_attempts=3,
+                ),
+                m.Task(
+                    task_type="send_request",
+                    status=m.TaskStatus.POSTPONED.value,
+                    campaign_id=int(camp.id),
+                    account_id=int(a2.id),
+                    target_id=int(t.id),
+                    scheduled_for=m.utc_now(),
+                    max_attempts=3,
+                ),
+            ]
+        )
+        db.commit()
+        return int(camp.id), int(t.id)
+
+    camp_id, target_id = m.db_exec(_seed)
+    m.set_chat_ui_value(1, "selected_campaign_id", camp_id)
+    m.handle_set_goal_jitter(_msg(text="10 20"))
+
+    assert "Очищено старых задач" in out.get("text", "")
+    assert "Добавлено недостающих задач" in out.get("text", "")
+
+    def _check(db):
+        active = (
+            db.query(m.Task)
+            .filter(
+                m.Task.task_type == "send_request",
+                m.Task.campaign_id == camp_id,
+                m.Task.target_id == target_id,
+                m.Task.status.in_(
+                    [
+                        m.TaskStatus.QUEUED.value,
+                        m.TaskStatus.POSTPONED.value,
+                        m.TaskStatus.RUNNING.value,
+                    ]
+                ),
+            )
+            .all()
+        )
+        return len(active), len({int(x.account_id) for x in active})
+
+    active_count, unique_accounts = m.db_exec(_check)
+    assert active_count == 1
+    assert unique_accounts == 1
+
+
 def test_set_goal_send_mode_and_force_cycle(fresh_main, monkeypatch):
     m = fresh_main
     monkeypatch.setattr(m, "cleanup_step", lambda *a, **k: None, raising=True)
@@ -870,6 +1035,14 @@ def test_set_goal_send_mode_and_force_cycle(fresh_main, monkeypatch):
     m.handle_set_goal_send_mode(_msg(text="2"))
     mode = m.db_exec(lambda db: m.get_campaign_send_mode(db, camp_id))
     assert mode == "target_first"
+    # Goal mode change rebuilds queue; clear it to isolate force-cycle behavior.
+    def _clear_send_queue(db):
+        db.query(m.Task).filter(
+            m.Task.task_type == "send_request",
+            m.Task.campaign_id == camp_id,
+        ).delete(synchronize_session=False)
+        db.commit()
+    m.db_exec(_clear_send_queue)
 
     m.handle_force_cycle_account(_msg(text=str(acc_id)))
     assert "Создано задач: 2" in out.get("text", "")
@@ -878,6 +1051,80 @@ def test_set_goal_send_mode_and_force_cycle(fresh_main, monkeypatch):
             m.Task.task_type == "send_request",
             m.Task.campaign_id == camp_id,
             m.Task.account_id == acc_id,
+            m.Task.last_error == "manual_forced_cycle",
+        ).count()
+    )
+    assert send_tasks == 2
+
+
+def test_set_goal_sender_pick_mode_and_force_cycle_random(fresh_main, monkeypatch):
+    m = fresh_main
+    monkeypatch.setattr(m, "cleanup_step", lambda *a, **k: None, raising=True)
+    monkeypatch.setattr(m.random, "shuffle", lambda arr: arr.reverse(), raising=True)
+    out = {}
+    monkeypatch.setattr(
+        m,
+        "show_menu_status",
+        lambda chat_id, menu_key, status_text: out.update({"menu": menu_key, "text": status_text}),
+        raising=True,
+    )
+
+    def _seed(db):
+        camp = m.Campaign(name="force_random_mode", enabled=True, jitter_min_sec=0, jitter_max_sec=0)
+        db.add(camp)
+        db.flush()
+        a1 = m.Account(
+            login="fr_1@example.com",
+            password="x",
+            enabled=True,
+            status=m.AccountStatus.ACTIVE.value,
+            epic_account_id="e1",
+            device_id="d1",
+            device_secret="s1",
+            daily_limit=100,
+            today_sent=0,
+            active_windows_json="[]",
+        )
+        a2 = m.Account(
+            login="fr_2@example.com",
+            password="x",
+            enabled=True,
+            status=m.AccountStatus.ACTIVE.value,
+            epic_account_id="e2",
+            device_id="d2",
+            device_secret="s2",
+            daily_limit=100,
+            today_sent=0,
+            active_windows_json="[]",
+        )
+        t1 = m.Target(username="fr_t1", campaign_id=int(camp.id), status=m.TargetStatus.NEW.value, required_senders=1)
+        t2 = m.Target(username="fr_t2", campaign_id=int(camp.id), status=m.TargetStatus.NEW.value, required_senders=1)
+        db.add_all([a1, a2, t1, t2])
+        db.commit()
+        return int(camp.id), int(a1.id), int(a2.id)
+
+    camp_id, _, acc2_id = m.db_exec(_seed)
+    m.set_chat_ui_value(1, "selected_campaign_id", camp_id)
+
+    m.handle_set_goal_sender_pick_mode(_msg(text="2"))
+    sender_pick = m.db_exec(lambda db: m.get_campaign_sender_pick_mode(db, camp_id))
+    assert sender_pick == "random"
+    # Sender pick mode change rebuilds queue; clear it to isolate force-cycle behavior.
+    def _clear_send_queue(db):
+        db.query(m.Task).filter(
+            m.Task.task_type == "send_request",
+            m.Task.campaign_id == camp_id,
+        ).delete(synchronize_session=False)
+        db.commit()
+    m.db_exec(_clear_send_queue)
+
+    m.handle_force_cycle_random(_msg(text="ok"))
+    assert f"Выбран аккаунт: #{acc2_id}" in out.get("text", "")
+    send_tasks = m.db_exec(
+        lambda db: db.query(m.Task).filter(
+            m.Task.task_type == "send_request",
+            m.Task.campaign_id == camp_id,
+            m.Task.account_id == acc2_id,
             m.Task.last_error == "manual_forced_cycle",
         ).count()
     )
@@ -976,6 +1223,93 @@ def test_show_menu_status_preserves_goal_context(fresh_main, monkeypatch):
     m.show_menu_status(chat_id, "targets", "test edit context")
     assert m.get_current_menu(chat_id) == "goal_edit"
     assert "Редактирование цели" in fb.sent[-1][1]
+
+
+def test_unknown_text_fallback_returns_to_current_menu(fresh_main, monkeypatch):
+    m = fresh_main
+    called = []
+    chat_id = 9901
+    monkeypatch.setattr(m, "show_selected_goal_menu", lambda cid: called.append(("goal_selected", cid)), raising=True)
+    m.set_current_menu(chat_id, "goal_selected")
+    m.cmd_reply_nav(_msg(chat_id=chat_id, text="какой-то текст"))
+    assert called[-1] == ("goal_selected", chat_id)
+
+
+def test_unknown_text_fallback_for_auth_operator(fresh_main, monkeypatch):
+    m = fresh_main
+    called = []
+    monkeypatch.setattr(m, "show_auth_operator_menu", lambda cid: called.append(cid), raising=True)
+    m.db_exec(lambda db: m.set_setting(db, m.AUTH_OPERATOR_IDS_SETTING_KEY, "77"))
+    m.cmd_reply_nav(_msg(chat_id=7001, user_id=77, text="unknown"))
+    assert called and called[-1] == 7001
+
+
+def test_handle_campaign_select_uses_goal_selected_status_screen(fresh_main, monkeypatch):
+    m = fresh_main
+    monkeypatch.setattr(m, "cleanup_step", lambda *a, **k: None, raising=True)
+
+    captured = {}
+    monkeypatch.setattr(
+        m,
+        "show_menu_status",
+        lambda chat_id, menu_key, status_text: captured.update(
+            {"chat_id": chat_id, "menu": menu_key, "text": status_text}
+        ),
+        raising=True,
+    )
+    called = []
+    monkeypatch.setattr(m, "show_selected_goal_menu", lambda chat_id: called.append(chat_id), raising=True)
+
+    camp_id = m.db_exec(
+        lambda db: (
+            db.add(m.Campaign(name="select_goal", enabled=False)),
+            db.commit(),
+            int(db.query(m.Campaign.id).filter(m.Campaign.name == "select_goal").first()[0]),
+        )[-1]
+    )
+
+    chat_id = 5001
+    m.handle_campaign_select(_msg(chat_id=chat_id, text=str(camp_id)))
+
+    assert captured["chat_id"] == chat_id
+    assert captured["menu"] == "goal_selected"
+    assert f"Выбрана цель #{camp_id}" in captured["text"]
+    assert called == []
+    assert m.get_chat_ui_int(chat_id, "selected_campaign_id", 0) == int(camp_id)
+
+
+def test_handle_delete_goal_single_success_uses_goal_manager_status_screen(fresh_main, monkeypatch):
+    m = fresh_main
+    monkeypatch.setattr(m, "cleanup_step", lambda *a, **k: None, raising=True)
+
+    captured = {}
+    monkeypatch.setattr(
+        m,
+        "show_menu_status",
+        lambda chat_id, menu_key, status_text: captured.update(
+            {"chat_id": chat_id, "menu": menu_key, "text": status_text}
+        ),
+        raising=True,
+    )
+    called = []
+    monkeypatch.setattr(m, "show_goal_manager_menu", lambda chat_id: called.append(chat_id), raising=True)
+
+    camp_id = m.db_exec(
+        lambda db: (
+            db.add(m.Campaign(name="delete_goal", enabled=False)),
+            db.commit(),
+            int(db.query(m.Campaign.id).filter(m.Campaign.name == "delete_goal").first()[0]),
+        )[-1]
+    )
+
+    chat_id = 5002
+    m.handle_delete_goal_single(_msg(chat_id=chat_id, text=str(camp_id)))
+
+    assert captured["chat_id"] == chat_id
+    assert captured["menu"] == "goal_manager"
+    assert f"Цель #{camp_id} удалена" in captured["text"]
+    assert called == []
+    assert m.db_exec(lambda db: db.query(m.Campaign).filter(m.Campaign.id == camp_id).count()) == 0
 
 
 def test_goal_edit_menu_routes_to_goal_specific_handlers(fresh_main, monkeypatch):

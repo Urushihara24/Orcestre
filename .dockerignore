@@ -18,5 +18,3 @@ README.md
 docker-compose.yml
 docker-compose.prod.yml
 docker-compose.postgres.yml
-tools/**
-!tools/healthcheck.py
