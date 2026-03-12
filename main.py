@@ -5578,7 +5578,6 @@ def cb_acc_refresh_names(call):
 
     threading.Thread(target=worker, daemon=True).start()
 
-
 @bot.callback_query_handler(func=lambda call: call.data == "acc_device_auto")
 @admin_only_call
 def cb_acc_device_auto(call):
