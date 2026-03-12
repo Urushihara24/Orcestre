@@ -54,6 +54,7 @@ from db_models import (
     Target,
     Task,
 )
+from recheck_manager import RecheckPair, RecheckQueuePlanner
 
 # ============================================================
 # КОНФИГУРАЦИЯ
@@ -1727,7 +1728,8 @@ def process_tasks_job():
                 )
                 if pre_status.ok and pre_status.code == "accepted":
                     tgt.status = TargetStatus.ACCEPTED.value
-                    tgt.accepted_count += 1
+                    if not _pair_was_accepted(db, int(tgt.id), int(acc.id)):
+                        tgt.accepted_count += 1
                     tgt.sent_count += 1
                     tgt.attempt_count += 1
                     tgt.last_attempt_at = now
@@ -1896,7 +1898,8 @@ def process_tasks_job():
                     accepted = h < int(rate * 100)
                     if accepted:
                         tgt.status = TargetStatus.ACCEPTED.value
-                        tgt.accepted_count += 1
+                        if not _pair_was_accepted(db, int(tgt.id), int(acc.id)):
+                            tgt.accepted_count += 1
                         acc.total_accepted += 1
                         task.last_error = "friend_status:accepted"
                     else:
@@ -1920,7 +1923,8 @@ def process_tasks_job():
                 if result.ok and result.code in ("accepted", "rejected", "pending"):
                     if result.code == "accepted":
                         tgt.status = TargetStatus.ACCEPTED.value
-                        tgt.accepted_count += 1
+                        if not _pair_was_accepted(db, int(tgt.id), int(acc.id)):
+                            tgt.accepted_count += 1
                         acc.total_accepted += 1
                         task.last_error = "friend_status:accepted"
                     elif result.code == "pending":
@@ -3245,6 +3249,65 @@ def _target_current_friends_map(db, target_ids: list[int]) -> dict[int, int]:
     return result
 
 
+def _target_accepted_unique_map(db, target_ids: list[int]) -> dict[int, int]:
+    """
+    Unique accepted count per target by (target, sender) pair.
+    Prevents overcount from repeated accepted checks for the same sender.
+    """
+    if not target_ids:
+        return {}
+    rows = (
+        db.query(Task.target_id, Task.account_id, Task.task_type, Task.last_error, Task.completed_at, Task.id)
+        .filter(
+            Task.target_id.in_([int(x) for x in target_ids]),
+            Task.status == TaskStatus.DONE.value,
+            Task.task_type.in_(["check_status", "send_request"]),
+        )
+        .order_by(
+            Task.target_id.asc(),
+            Task.account_id.asc(),
+            Task.completed_at.desc().nullslast(),
+            Task.id.desc(),
+        )
+        .all()
+    )
+    result: dict[int, int] = {}
+    seen_pairs: set[tuple[int, int]] = set()
+    for target_id, account_id, task_type, last_error, _, _ in rows:
+        pair = (int(target_id), int(account_id))
+        if pair in seen_pairs:
+            continue
+        sender_status = str(last_error or "").strip().lower()
+        is_accepted = (task_type == "check_status" and sender_status == "friend_status:accepted") or (
+            task_type == "send_request" and sender_status == "already_accepted_before_send"
+        )
+        if not is_accepted:
+            continue
+        seen_pairs.add(pair)
+        result[int(target_id)] = int(result.get(int(target_id), 0)) + 1
+    return result
+
+
+def _pair_was_accepted(db, target_id: int, account_id: int) -> bool:
+    """
+    Whether sender->target pair was already observed as accepted in DONE tasks.
+    """
+    row = (
+        db.query(Task.id)
+        .filter(
+            Task.target_id == int(target_id),
+            Task.account_id == int(account_id),
+            Task.status == TaskStatus.DONE.value,
+            or_(
+                and_(Task.task_type == "check_status", Task.last_error == "friend_status:accepted"),
+                and_(Task.task_type == "send_request", Task.last_error == "already_accepted_before_send"),
+            ),
+        )
+        .first()
+    )
+    return bool(row)
+
+
 def show_accounts_list(chat_id: int, page: int = 1, query: str = ""):
     query = _normalized_search_query(query)
 
@@ -3344,6 +3407,7 @@ def show_targets_status(chat_id: int, page: int = 1, query: str = ""):
     targets, total, pages, page_clamped, senders_map, friends_now_map, by_status, default_required, camp_name = db_exec(_inner)
     set_chat_ui_value(chat_id, "tgt_page", page_clamped)
     set_chat_ui_value(chat_id, "tgt_query", query)
+    set_chat_ui_value(chat_id, "tgt_view_mode", "targets")
 
     if total == 0:
         suffix = f" по запросу {md_inline_code(query)}" if query else ""
@@ -3403,11 +3467,23 @@ def show_targets_receiver_stats(chat_id: int, page: int = 1, query: str = ""):
         )
         ids = [int(t.id) for t in targets]
         friends_now_map = _target_current_friends_map(db, ids)
+        accepted_unique_map = _target_accepted_unique_map(db, ids)
+        sent_done_map = {}
         send_q_map = {}
         check_q_map = {}
         revoke_map = {}
         remove_map = {}
         if ids:
+            sent_done_rows = (
+                db.query(Task.target_id, func.count(Task.id))
+                .filter(
+                    Task.target_id.in_(ids),
+                    Task.task_type == "send_request",
+                    Task.status == TaskStatus.DONE.value,
+                )
+                .group_by(Task.target_id)
+                .all()
+            )
             send_q_rows = (
                 db.query(Task.target_id, func.count(Task.id))
                 .filter(
@@ -3428,6 +3504,7 @@ def show_targets_receiver_stats(chat_id: int, page: int = 1, query: str = ""):
                 .group_by(Task.target_id)
                 .all()
             )
+            sent_done_map = {int(tid): int(cnt or 0) for tid, cnt in sent_done_rows}
             send_q_map = {int(tid): int(cnt or 0) for tid, cnt in send_q_rows}
             check_q_map = {int(tid): int(cnt or 0) for tid, cnt in check_q_rows}
             revoke_rows = (
@@ -3454,11 +3531,38 @@ def show_targets_receiver_stats(chat_id: int, page: int = 1, query: str = ""):
             remove_map = {int(tid): int(cnt or 0) for tid, cnt in remove_rows}
         camp = get_campaign_or_default(db, selected_campaign_id)
         camp_name = camp.name if camp else f"#{selected_campaign_id}"
-        return targets, total, pages, page_clamped, send_q_map, check_q_map, revoke_map, remove_map, friends_now_map, camp_name
+        return (
+            targets,
+            total,
+            pages,
+            page_clamped,
+            send_q_map,
+            check_q_map,
+            revoke_map,
+            remove_map,
+            friends_now_map,
+            accepted_unique_map,
+            sent_done_map,
+            camp_name,
+        )
 
-    targets, total, pages, page_clamped, send_q_map, check_q_map, revoke_map, remove_map, friends_now_map, camp_name = db_exec(_inner)
+    (
+        targets,
+        total,
+        pages,
+        page_clamped,
+        send_q_map,
+        check_q_map,
+        revoke_map,
+        remove_map,
+        friends_now_map,
+        accepted_unique_map,
+        sent_done_map,
+        camp_name,
+    ) = db_exec(_inner)
     set_chat_ui_value(chat_id, "tgt_page", page_clamped)
     set_chat_ui_value(chat_id, "tgt_query", query)
+    set_chat_ui_value(chat_id, "tgt_view_mode", "receiver_stats")
 
     if total == 0:
         suffix = f" по запросу {md_inline_code(query)}" if query else ""
@@ -3469,9 +3573,16 @@ def show_targets_receiver_stats(chat_id: int, page: int = 1, query: str = ""):
     if query:
         lines.append(f"Фильтр: {md_inline_code(query)}")
     lines.append(f"Страница: {page_clamped}/{pages} (по {TARGETS_PAGE_SIZE})")
+    lines.append("Листай: ◀️ Ники / ▶️ Ники")
     lines.append("")
     for t in targets:
         rejected = 1 if t.status == TargetStatus.REJECTED.value else 0
+        accepted_unique = int(accepted_unique_map.get(int(t.id), 0))
+        sent_total = max(
+            int(t.sent_count or 0),
+            int(sent_done_map.get(int(t.id), 0)),
+            accepted_unique,
+        )
         send_q = int(send_q_map.get(int(t.id), 0))
         check_q = int(check_q_map.get(int(t.id), 0))
         revoked = int(revoke_map.get(int(t.id), 0))
@@ -3479,8 +3590,8 @@ def show_targets_receiver_stats(chat_id: int, page: int = 1, query: str = ""):
         lines.append(f"• #{t.id} {md_inline_code(t.username)}")
         lines.append(f"  Статус: {target_status_ru(t.status)}")
         lines.append(
-            f"  Отпр/Прин/В друзьях/Откл: "
-            f"{int(t.sent_count or 0)}/{int(t.accepted_count or 0)}/{int(friends_now_map.get(int(t.id), 0))}/{rejected}"
+            f"  Отпр/Принято(уник)/В друзьях/Откл: "
+            f"{sent_total}/{accepted_unique}/{int(friends_now_map.get(int(t.id), 0))}/{rejected}"
         )
         lines.append(f"  Очередь send/check: {send_q}/{check_q}")
         lines.append(f"  Отозвано/Удалено: {revoked}/{removed}")
@@ -3624,6 +3735,19 @@ def show_campaign_progress(chat_id: int, with_campaign_info: bool = False):
         ).all()
         ready_account_ids = [int(a.id) for a in ready_accounts]
         ready_count = len(ready_account_ids)
+        used_sender_rows = (
+            db.query(Task.account_id)
+            .filter(
+                task_campaign_filter(db, selected_campaign_id),
+                Task.task_type == "send_request",
+                Task.status == TaskStatus.DONE.value,
+            )
+            .distinct()
+            .all()
+        )
+        used_sender_ids = {int(x[0]) for x in used_sender_rows}
+        used_ready_count = len(set(ready_account_ids) & used_sender_ids)
+        unused_ready_count = max(0, int(ready_count) - int(used_ready_count))
         at_limit_count = 0
         if camp is not None:
             eff_limit = _campaign_effective_daily_limit(db, camp, now)
@@ -3636,6 +3760,21 @@ def show_campaign_progress(chat_id: int, with_campaign_info: bool = False):
                 if int(a.today_sent or 0) >= int(a.daily_limit or 0):
                     at_limit_count += 1
         default_required = max(1, get_setting_int(db, "target_senders_count", DEFAULT_TARGET_SENDERS_COUNT))
+        max_required_per_target = 0
+        targets_with_sender_deficit = 0
+        max_done_per_target = 0
+        targets_pool_exhausted = 0
+        for _, _, required_senders in targets:
+            req = int(required_senders or 0) or default_required
+            max_required_per_target = max(max_required_per_target, int(req))
+            if int(req) > int(ready_count):
+                targets_with_sender_deficit += 1
+        for tid, _, _ in targets:
+            done = int(senders_map.get(int(tid), 0))
+            max_done_per_target = max(max_done_per_target, done)
+            if int(ready_count) > 0 and done >= int(ready_count):
+                targets_pool_exhausted += 1
+        pool_layers_left = max(0, int(ready_count) - int(max_done_per_target))
         campaign_id = int(camp.id) if camp else 0
         campaign_num = campaign_ui_num(db, campaign_id) if camp else 0
         camp_name = camp.name if camp else "Текущая"
@@ -3656,7 +3795,14 @@ def show_campaign_progress(chat_id: int, with_campaign_info: bool = False):
             int(awaiting_response),
             int(waiting_delivery),
             int(ready_count),
+            int(used_ready_count),
+            int(unused_ready_count),
             int(at_limit_count),
+            int(max_required_per_target),
+            int(targets_with_sender_deficit),
+            int(max_done_per_target),
+            int(pool_layers_left),
+            int(targets_pool_exhausted),
             default_required,
             camp_name,
         )
@@ -3678,7 +3824,14 @@ def show_campaign_progress(chat_id: int, with_campaign_info: bool = False):
         awaiting_response,
         waiting_delivery,
         ready_count,
+        used_ready_count,
+        unused_ready_count,
         at_limit_count,
+        max_required_per_target,
+        targets_with_sender_deficit,
+        max_done_per_target,
+        pool_layers_left,
+        targets_pool_exhausted,
         default_required,
         camp_name,
     ) = db_exec(_inner)
@@ -3716,6 +3869,7 @@ def show_campaign_progress(chat_id: int, with_campaign_info: bool = False):
             fully_covered += 1
 
     remaining = max(0, required_total - covered_total)
+    sender_deficit_per_nick = max(0, int(max_required_per_target) - int(ready_count))
     title = (
         f"📈 Прогресс цели №{campaign_num} {camp_name} (id:{campaign_id})"
         if campaign_id > 0
@@ -3742,7 +3896,19 @@ def show_campaign_progress(chat_id: int, with_campaign_info: bool = False):
         f"• Отправляли сегодня: {senders_today}",
         f"• Отправляли всего: {senders_total}",
         f"• Готовы к работе (active+device_auth): {ready_count}",
+        f"• Уже использовались в цели: {used_ready_count}",
+        f"• Ещё не использовались в цели: {unused_ready_count}",
         f"• Уперлись в дневной лимит: {at_limit_count}",
+        "",
+        "Ёмкость по цели:",
+        f"• Макс. нужно отправителей на ник: {max_required_per_target}",
+        f"• Ников с нехваткой отправителей: {targets_with_sender_deficit}",
+        f"• Дефицит отправителей на ник (макс): {sender_deficit_per_nick}",
+        "",
+        "Запас отправителей (по текущему прогрессу):",
+        f"• Самый покрытый ник: {max_done_per_target}/{ready_count} отправителей",
+        f"• Осталось до исчерпания пула: {pool_layers_left}",
+        f"• Ников уже уперлись в пул: {targets_pool_exhausted}",
         "",
         "Статусы целей:",
         f"🆕 новая={int(status_counts.get(TargetStatus.NEW.value, 0) or 0)}",
@@ -3752,6 +3918,10 @@ def show_campaign_progress(chat_id: int, with_campaign_info: bool = False):
         f"❌ отклонено={int(status_counts.get(TargetStatus.REJECTED.value, 0) or 0)}",
         f"🚫 ошибка={int(status_counts.get(TargetStatus.FAILED.value, 0) or 0)}",
     ]
+    if sender_deficit_per_nick > 0:
+        lines.append(
+            f"⚠️ Для полного покрытия добавь минимум {sender_deficit_per_nick} аккаунт(ов)-отправителей."
+        )
     if with_campaign_info:
         with SessionLocal() as db:
             c = db.query(Campaign).filter(Campaign.id == int(campaign_id)).first()
@@ -4064,12 +4234,20 @@ def _handle_targets_goals_actions(message, text: str, chat_id: int) -> bool:
     if text == "◀️ Ники":
         page = get_chat_ui_int(chat_id, "tgt_page", 1) - 1
         query = str(get_chat_ui_value(chat_id, "tgt_query", "") or "")
-        show_targets_status(chat_id, page=page, query=query)
+        mode = str(get_chat_ui_value(chat_id, "tgt_view_mode", "targets") or "targets")
+        if mode == "receiver_stats":
+            show_targets_receiver_stats(chat_id, page=page, query=query)
+        else:
+            show_targets_status(chat_id, page=page, query=query)
         return True
     if text == "▶️ Ники":
         page = get_chat_ui_int(chat_id, "tgt_page", 1) + 1
         query = str(get_chat_ui_value(chat_id, "tgt_query", "") or "")
-        show_targets_status(chat_id, page=page, query=query)
+        mode = str(get_chat_ui_value(chat_id, "tgt_view_mode", "targets") or "targets")
+        if mode == "receiver_stats":
+            show_targets_receiver_stats(chat_id, page=page, query=query)
+        else:
+            show_targets_status(chat_id, page=page, query=query)
         return True
     if text == "◀️ Отправители":
         target_id = int(get_chat_ui_int(chat_id, "senders_target_id", 0))
@@ -4371,7 +4549,12 @@ def handle_accounts_search_query(message):
 def handle_targets_search_query(message):
     cleanup_step(message)
     query = (message.text or "").strip()
-    show_targets_status(message.chat.id, page=1, query=query)
+    chat_id = int(message.chat.id)
+    mode = str(get_chat_ui_value(chat_id, "tgt_view_mode", "targets") or "targets")
+    if mode == "receiver_stats":
+        show_targets_receiver_stats(chat_id, page=1, query=query)
+    else:
+        show_targets_status(chat_id, page=1, query=query)
 
 
 CAMPAIGN_WIZARD_STATE = {}
@@ -6854,7 +7037,7 @@ def create_recheck_tasks_job():
                 continue
 
             rows = (
-                db.query(Task.account_id, Task.target_id)
+                db.query(Task.account_id, Task.target_id, Target.username)
                 .join(Target, Target.id == Task.target_id)
                 .filter(
                     Task.task_type == "send_request",
@@ -6866,17 +7049,38 @@ def create_recheck_tasks_job():
                 .limit(max(remaining * 5, 100))
                 .all()
             )
+            send_mode = get_campaign_send_mode(db, camp_id)
+            if send_mode == "target_first":
+                planner = RecheckQueuePlanner(
+                    mode="nickname",
+                    shuffle_groups=True,          # random nickname order
+                    shuffle_inside_group=False,   # keep sender order inside nickname group
+                    seed=random.randint(1, 10**9),
+                )
+            else:
+                planner = RecheckQueuePlanner(
+                    mode="sender",
+                    shuffle_groups=False,         # keep sender sequence
+                    shuffle_inside_group=True,    # random nicknames for each sender
+                    seed=random.randint(1, 10**9),
+                )
+            planner.build(
+                RecheckPair(
+                    account_id=int(account_id),
+                    target_id=int(target_id),
+                    nickname=str(username or ""),
+                )
+                for account_id, target_id, username in rows
+            )
+            ordered_pairs = planner.pop_many(len(rows))
 
             created = 0
             now = utc_now()
-            seen_pairs: set[tuple[int, int]] = set()
-            for account_id, target_id in rows:
+            for pair in ordered_pairs:
                 if created >= remaining:
                     break
-                pair = (int(account_id), int(target_id))
-                if pair in seen_pairs:
-                    continue
-                seen_pairs.add(pair)
+                account_id = int(pair.account_id)
+                target_id = int(pair.target_id)
 
                 has_active_check = db.query(Task.id).filter(
                     Task.task_type == "check_status",

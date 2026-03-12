@@ -342,7 +342,7 @@ def test_add_same_nick_in_different_goals_via_ui_handler(fresh_main, monkeypatch
 def test_reply_nav_routes_new_pagination_search_and_progress(fresh_main, monkeypatch):
     m = fresh_main
 
-    called = {"acc": [], "tgt": [], "progress": 0, "ask": []}
+    called = {"acc": [], "tgt": [], "tgt_stats": [], "progress": 0, "ask": []}
 
     monkeypatch.setattr(
         m,
@@ -354,6 +354,12 @@ def test_reply_nav_routes_new_pagination_search_and_progress(fresh_main, monkeyp
         m,
         "show_targets_status",
         lambda chat_id, page=1, query="": called["tgt"].append((chat_id, page, query)),
+        raising=True,
+    )
+    monkeypatch.setattr(
+        m,
+        "show_targets_receiver_stats",
+        lambda chat_id, page=1, query="": called["tgt_stats"].append((chat_id, page, query)),
         raising=True,
     )
     monkeypatch.setattr(
@@ -387,9 +393,16 @@ def test_reply_nav_routes_new_pagination_search_and_progress(fresh_main, monkeyp
 
     assert called["acc"] == [(chat_id, 2, "mail"), (chat_id, 4, "mail")]
     assert called["tgt"] == [(chat_id, 3, "nick"), (chat_id, 5, "nick")]
+    assert called["tgt_stats"] == []
     assert called["progress"] == 1
     assert called["ask"][0][2] == "handle_accounts_search_query"
     assert called["ask"][1][2] == "handle_targets_search_query"
+
+    # Pagination in receiver stats mode should stay in receiver stats screen.
+    m.set_chat_ui_value(chat_id, "tgt_view_mode", "receiver_stats")
+    m.cmd_reply_nav(_msg(chat_id=chat_id, user_id=1, text="◀️ Ники"))
+    m.cmd_reply_nav(_msg(chat_id=chat_id, user_id=1, text="▶️ Ники"))
+    assert called["tgt_stats"] == [(chat_id, 3, "nick"), (chat_id, 5, "nick")]
 
 
 def test_show_accounts_list_pagination_and_filter(fresh_main, monkeypatch):
@@ -489,6 +502,8 @@ def test_show_targets_status_and_campaign_progress(fresh_main, monkeypatch):
     assert "📈 Прогресс текущей цели" in progress_text
     assert "Целей: 2" in progress_text
     assert "Покрытие отправителей: 1/3" in progress_text
+    assert "Самый покрытый ник: 1/2 отправителей" in progress_text
+    assert "Осталось до исчерпания пула: 1" in progress_text
 
 
 def test_show_targets_receiver_stats_lists_per_nick_metrics(fresh_main, monkeypatch):
@@ -562,9 +577,39 @@ def test_show_targets_receiver_stats_lists_per_nick_metrics(fresh_main, monkeypa
     txt = fb.sent[-1][1]
     assert "Статусы по никам" in txt
     assert "nick_a" in txt
-    assert "5/2/1/0" in txt
+    assert "5/1/1/0" in txt
     assert "nick_b" in txt
     assert "3/0/0/1" in txt
+
+
+def test_handle_targets_search_query_routes_by_current_view_mode(fresh_main, monkeypatch):
+    m = fresh_main
+    called = {"targets": [], "stats": []}
+
+    monkeypatch.setattr(m, "cleanup_step", lambda *a, **k: None, raising=True)
+    monkeypatch.setattr(
+        m,
+        "show_targets_status",
+        lambda chat_id, page=1, query="": called["targets"].append((chat_id, page, query)),
+        raising=True,
+    )
+    monkeypatch.setattr(
+        m,
+        "show_targets_receiver_stats",
+        lambda chat_id, page=1, query="": called["stats"].append((chat_id, page, query)),
+        raising=True,
+    )
+
+    chat_id = 1234
+    msg = _msg(chat_id=chat_id, text="fox")
+
+    m.set_chat_ui_value(chat_id, "tgt_view_mode", "targets")
+    m.handle_targets_search_query(msg)
+    m.set_chat_ui_value(chat_id, "tgt_view_mode", "receiver_stats")
+    m.handle_targets_search_query(msg)
+
+    assert called["targets"] == [(chat_id, 1, "fox")]
+    assert called["stats"] == [(chat_id, 1, "fox")]
 
 
 def test_bulk_delete_accounts_and_targets(fresh_main, monkeypatch):
@@ -1176,6 +1221,74 @@ def test_tgt_distribute_shows_reason_when_zero_created(fresh_main, monkeypatch):
 
     assert any("Создано задач: 0" in x[2] for x in captured)
     assert any("В очереди отправки" in x[2] for x in captured)
+
+
+def test_recheck_uses_campaign_send_mode_for_planner_strategy(fresh_main, monkeypatch):
+    m = fresh_main
+    captured = {}
+
+    class _FakePlanner:
+        def __init__(self, mode="sender", shuffle_groups=False, shuffle_inside_group=True, seed=None):
+            captured["mode"] = mode
+            captured["shuffle_groups"] = bool(shuffle_groups)
+            captured["shuffle_inside_group"] = bool(shuffle_inside_group)
+            self._pairs = []
+
+        def build(self, pairs):
+            self._pairs = list(pairs)
+
+        def pop_many(self, limit):
+            return list(self._pairs)[: int(limit)]
+
+    monkeypatch.setattr(m, "RecheckQueuePlanner", _FakePlanner, raising=True)
+
+    def _seed(db):
+        now = m.utc_now()
+        acc = m.Account(
+            login="strategy_recheck@example.com",
+            password="x",
+            enabled=True,
+            status=m.AccountStatus.ACTIVE.value,
+            epic_account_id="e",
+            device_id="d",
+            device_secret="s",
+            daily_limit=500,
+            today_sent=0,
+            active_windows_json="[]",
+        )
+        camp = m.Campaign(name="strategy_recheck_goal", enabled=True, recheck_daily_limit=5, jitter_min_sec=0, jitter_max_sec=0)
+        db.add_all([acc, camp])
+        db.commit()
+        db.refresh(acc)
+        db.refresh(camp)
+
+        m.set_campaign_send_mode(db, int(camp.id), "target_first")
+        db.commit()
+
+        tgt = m.Target(username="strategy_target", campaign_id=int(camp.id), status=m.TargetStatus.PENDING.value, required_senders=1)
+        db.add(tgt)
+        db.commit()
+        db.refresh(tgt)
+
+        db.add(
+            m.Task(
+                task_type="send_request",
+                status=m.TaskStatus.DONE.value,
+                campaign_id=int(camp.id),
+                account_id=int(acc.id),
+                target_id=int(tgt.id),
+                scheduled_for=now,
+                completed_at=now,
+            )
+        )
+        db.commit()
+
+    m.db_exec(_seed)
+    created = m.create_recheck_tasks_job()
+    assert created >= 1
+    assert captured["mode"] == "nickname"
+    assert captured["shuffle_groups"] is True
+    assert captured["shuffle_inside_group"] is False
 
 
 def test_reply_back_navigation_by_menu_context(fresh_main, monkeypatch):

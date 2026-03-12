@@ -22,6 +22,10 @@ def _campaign_sender_pick_mode_key(campaign_id: int) -> str:
     return f"campaign_sender_pick_mode_{int(campaign_id)}"
 
 
+def _campaign_recheck_target_order_key(campaign_id: int) -> str:
+    return f"campaign_recheck_target_order_{int(campaign_id)}"
+
+
 def get_campaign_send_mode(db, campaign_id: int) -> str:
     raw = str(_get_setting(db, _campaign_send_mode_key(int(campaign_id)), "sender_first") or "").strip().lower()
     if raw not in {"sender_first", "target_first"}:
@@ -48,6 +52,20 @@ def set_campaign_sender_pick_mode(db, campaign_id: int, mode: str) -> None:
     if val not in {"ordered", "random"}:
         val = "ordered"
     _set_setting(db, _campaign_sender_pick_mode_key(int(campaign_id)), val)
+
+
+def get_campaign_recheck_target_order(db, campaign_id: int) -> str:
+    raw = str(_get_setting(db, _campaign_recheck_target_order_key(int(campaign_id)), "recent") or "").strip().lower()
+    if raw not in {"recent", "random"}:
+        return "recent"
+    return raw
+
+
+def set_campaign_recheck_target_order(db, campaign_id: int, mode: str) -> None:
+    val = str(mode or "").strip().lower()
+    if val not in {"recent", "random"}:
+        val = "recent"
+    _set_setting(db, _campaign_recheck_target_order_key(int(campaign_id)), val)
 
 
 def campaign_ui_num(db, campaign_id: int) -> int:
