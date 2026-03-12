@@ -16,6 +16,11 @@ services:
       interval: 10s
       timeout: 5s
       retries: 10
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
 
   app:
     build:
@@ -41,6 +46,11 @@ services:
       interval: 30s
       timeout: 10s
       retries: 5
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
 
 volumes:
   egs_postgres_data:

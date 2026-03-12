@@ -16,6 +16,8 @@ RUN pip install --no-cache-dir -r /app/requirements.txt
 
 # Runtime sources only.
 COPY main.py /app/main.py
+COPY recheck_manager.py /app/recheck_manager.py
+COPY campaign_settings.py /app/campaign_settings.py
 COPY db_models.py /app/db_models.py
 COPY epic_api_client.py /app/epic_api_client.py
 COPY epic_device_auth.py /app/epic_device_auth.py
