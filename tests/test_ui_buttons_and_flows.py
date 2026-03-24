@@ -1225,6 +1225,89 @@ def test_set_goal_sender_pick_mode_and_force_cycle_random(fresh_main, monkeypatc
     assert send_tasks == 2
 
 
+def test_force_cycle_replaces_known_connected_sender(fresh_main):
+    m = fresh_main
+
+    def _seed(db):
+        camp = m.Campaign(name="force_replace_connected", enabled=True, jitter_min_sec=0, jitter_max_sec=0)
+        db.add(camp)
+        db.flush()
+        a1 = m.Account(
+            login="fc1@example.com",
+            password="x",
+            enabled=True,
+            status=m.AccountStatus.ACTIVE.value,
+            epic_account_id="fce1",
+            device_id="fcd1",
+            device_secret="fcs1",
+            daily_limit=100,
+            today_sent=0,
+            active_windows_json="[]",
+        )
+        a2 = m.Account(
+            login="fc2@example.com",
+            password="x",
+            enabled=True,
+            status=m.AccountStatus.ACTIVE.value,
+            epic_account_id="fce2",
+            device_id="fcd2",
+            device_secret="fcs2",
+            daily_limit=100,
+            today_sent=0,
+            active_windows_json="[]",
+        )
+        t1 = m.Target(
+            username="fc_target_1",
+            campaign_id=int(camp.id),
+            status=m.TargetStatus.PENDING.value,
+            required_senders=1,
+        )
+        db.add_all([a1, a2, t1])
+        db.flush()
+
+        # Known connected pair for a1 -> t1.
+        db.add(
+            m.Task(
+                task_type="check_status",
+                status=m.TaskStatus.DONE.value,
+                campaign_id=int(camp.id),
+                account_id=int(a1.id),
+                target_id=int(t1.id),
+                scheduled_for=m.utc_now(),
+                completed_at=m.utc_now(),
+                last_error="friend_status:accepted",
+            )
+        )
+        db.commit()
+        return int(camp.id), int(a1.id), int(a2.id), int(t1.id)
+
+    camp_id, a1_id, a2_id, tgt_id = m.db_exec(_seed)
+
+    def _run(db):
+        camp = db.query(m.Campaign).filter(m.Campaign.id == camp_id).first()
+        acc = db.query(m.Account).filter(m.Account.id == a1_id).first()
+        result = m._create_manual_force_cycle_for_account(db, camp, acc)
+        db.commit()
+        return result
+
+    res = m.db_exec(_run)
+    assert res.get("ok") is True
+    assert int(res.get("created", 0)) == 0
+    assert int(res.get("replaced_connected", 0)) == 1
+
+    queued = m.db_exec(
+        lambda db: db.query(m.Task).filter(
+            m.Task.task_type == "send_request",
+            m.Task.campaign_id == camp_id,
+            m.Task.account_id == a2_id,
+            m.Task.target_id == tgt_id,
+            m.Task.status == m.TaskStatus.QUEUED.value,
+            m.Task.last_error == "replacement_after_manual_connected",
+        ).count()
+    )
+    assert queued == 1
+
+
 def test_tgt_distribute_shows_reason_when_zero_created(fresh_main, monkeypatch):
     m = fresh_main
     captured = []
