@@ -1,3 +1,4 @@
+from datetime import timedelta
 from types import SimpleNamespace
 
 
@@ -218,3 +219,85 @@ def test_handle_document_routes_to_nickname_change_import_mode(fresh_main, monke
     m.handle_document(_doc_msg(file_name="nick_change.txt"))
     assert out["menu_key"] == "accounts"
     assert "смены ников" in out["status_text"]
+
+
+def test_nickname_change_auto_fallback_on_taken(fresh_main, monkeypatch):
+    m = fresh_main
+    now = m.utc_now()
+
+    def _seed(db):
+        # Allow immediate repeated API ops in test.
+        m.set_setting(db, "min_request_interval_sec", "0")
+        m.set_setting(db, "max_request_interval_sec", "0")
+        m.set_setting(db, "hourly_api_limit", "1000")
+        m.set_setting(db, "daily_api_limit", "1000")
+        acc = m.Account(
+            id=1,
+            login="acc1@example.com",
+            password="x",
+            status=m.AccountStatus.ACTIVE.value,
+            enabled=True,
+            epic_account_id="epic-1",
+            device_id="dev-1",
+            device_secret="sec-1",
+        )
+        db.add(acc)
+        db.commit()
+        db.add(
+            m.NicknameChangeTask(
+                account_id=1,
+                requested_nick="TakenNick",
+                status=m.NicknameChangeStatus.QUEUED.value,
+                scheduled_for=now,
+                max_attempts=4,
+            )
+        )
+        db.commit()
+
+    m.db_exec(_seed)
+    m.DRY_RUN = False
+
+    calls = {"n": 0, "seen": []}
+
+    def _change(**kwargs):
+        nick = str(kwargs.get("new_display_name") or "")
+        calls["n"] += 1
+        calls["seen"].append(nick)
+        if calls["n"] == 1:
+            return SimpleNamespace(ok=False, code="nickname_taken", message="taken", data={})
+        return SimpleNamespace(ok=True, code="display_name_changed", message="ok", data={"display_name": nick})
+
+    monkeypatch.setattr(m, "change_display_name_with_device", _change, raising=True)
+
+    # First run: nickname_taken -> task postponed with auto candidate.
+    processed = m.process_nickname_change_tasks_job()
+    assert processed >= 1
+
+    def _after_first(db):
+        task = db.query(m.NicknameChangeTask).first()
+        return task.status, task.requested_nick, task.last_error
+
+    status1, requested1, err1 = m.db_exec(_after_first)
+    assert status1 == m.NicknameChangeStatus.POSTPONED.value
+    assert requested1 != "TakenNick"
+    assert str(err1).startswith("nickname_taken_retry:")
+
+    # Make postponed task due now and process second attempt.
+    def _make_due(db):
+        task = db.query(m.NicknameChangeTask).first()
+        task.scheduled_for = m.utc_now() - timedelta(seconds=1)
+        db.commit()
+
+    m.db_exec(_make_due)
+    processed2 = m.process_nickname_change_tasks_job()
+    assert processed2 >= 1
+
+    def _after_second(db):
+        acc = db.query(m.Account).filter(m.Account.id == 1).first()
+        task = db.query(m.NicknameChangeTask).first()
+        return acc.epic_display_name, task.status, task.final_nick
+
+    disp, status2, final_nick = m.db_exec(_after_second)
+    assert status2 == m.NicknameChangeStatus.DONE.value
+    assert disp == requested1
+    assert final_nick == requested1

@@ -216,6 +216,29 @@ TARGET_RECHECK_ELIGIBLE_STATUSES = (
 )
 
 NICKNAME_ALLOWED_RE = re.compile(r"^[A-Za-z0-9_]{3,16}$")
+NICKNAME_FALLBACK_LIMIT = 12
+NICKNAME_VISUAL_SUBS: dict[str, tuple[str, ...]] = {
+    "a": ("4",),
+    "b": ("8",),
+    "e": ("3",),
+    "g": ("9",),
+    "i": ("1",),
+    "l": ("1",),
+    "o": ("0",),
+    "q": ("9",),
+    "s": ("5",),
+    "t": ("7",),
+    "z": ("2",),
+    "0": ("o",),
+    "1": ("i", "l"),
+    "2": ("z",),
+    "3": ("e",),
+    "4": ("a",),
+    "5": ("s",),
+    "7": ("t",),
+    "8": ("b",),
+    "9": ("g", "q"),
+}
 
 PRECHECK_SKIP_REASONS = (
     "precheck_accepted_skip",
@@ -520,6 +543,55 @@ def validate_requested_nickname(raw_value: str) -> tuple[bool, str]:
     if not NICKNAME_ALLOWED_RE.fullmatch(nickname):
         return False, "формат: только латиница/цифры/_ и длина 3..16"
     return True, ""
+
+
+def _nickname_fallback_candidates(nickname: str, limit: int = NICKNAME_FALLBACK_LIMIT) -> list[str]:
+    """
+    Построить кандидатов "похожих" ников (ASCII-safe):
+    - визуальные подмены символов (o->0, s->5, ...)
+    - суффиксы, если ник всё ещё занят.
+    """
+    base = str(nickname or "").strip()
+    ok, _ = validate_requested_nickname(base)
+    if not ok:
+        return []
+
+    out: list[str] = []
+    seen: set[str] = {base}
+
+    def _push(val: str):
+        if len(out) >= int(limit):
+            return
+        if not val or val in seen:
+            return
+        v_ok, _ = validate_requested_nickname(val)
+        if not v_ok:
+            return
+        seen.add(val)
+        out.append(val)
+
+    # 1) Single-char visual substitutions.
+    for i, ch in enumerate(base):
+        repls = NICKNAME_VISUAL_SUBS.get(ch.lower(), ())
+        for repl in repls:
+            cand = f"{base[:i]}{repl}{base[i + 1:]}"
+            _push(cand)
+            if len(out) >= int(limit):
+                return out
+
+    # 2) Suffix variants (append or overwrite tail).
+    suffixes = ("1", "2", "3", "5", "7", "8", "9", "01", "02", "03", "11", "77")
+    for suf in suffixes:
+        if len(base) + len(suf) <= 16:
+            cand = f"{base}{suf}"
+        else:
+            keep = max(0, 16 - len(suf))
+            cand = f"{base[:keep]}{suf}"
+        _push(cand)
+        if len(out) >= int(limit):
+            return out
+
+    return out
 
 
 def get_runtime_timezone(db) -> ZoneInfo:
@@ -2647,7 +2719,18 @@ def process_nickname_change_tasks_job():
                     if result.code == "rate_limited":
                         job.status = NicknameChangeStatus.POSTPONED.value
                         job.scheduled_for = now + timedelta(minutes=30)
-                    elif result.code in {"nickname_cooldown", "nickname_taken", "invalid_nickname"}:
+                    elif result.code == "nickname_taken":
+                        variants = _nickname_fallback_candidates(str(job.requested_nick))
+                        next_nick = variants[0] if variants else ""
+                        if next_nick and int(job.attempt_number or 0) < int(job.max_attempts or 3):
+                            job.requested_nick = next_nick
+                            job.status = NicknameChangeStatus.POSTPONED.value
+                            job.scheduled_for = now + timedelta(minutes=5)
+                            job.last_error = f"nickname_taken_retry:{next_nick}"
+                        else:
+                            job.status = NicknameChangeStatus.FAILED.value
+                            job.completed_at = now
+                    elif result.code in {"nickname_cooldown", "invalid_nickname"}:
                         job.status = NicknameChangeStatus.FAILED.value
                         job.completed_at = now
                     elif result.code == "password_grant_blocked":
