@@ -485,7 +485,7 @@ class TestMainAdditional(unittest.TestCase):
         finally:
             db.close()
 
-    def test_create_recheck_tasks_job_respects_per_goal_daily_limits(self):
+    def test_create_recheck_tasks_job_respects_per_goal_daily_sender_limits(self):
         m = self.main
         db = m.SessionLocal()
         try:
@@ -570,14 +570,15 @@ class TestMainAdditional(unittest.TestCase):
             self.assertEqual(day1, m.utc_today().isoformat())
             self.assertEqual(day2, m.utc_today().isoformat())
             self.assertEqual(m.get_setting_int(db, f"recheck_counter_value_{c1_id}", 0), 1)
-            self.assertEqual(m.get_setting_int(db, f"recheck_counter_value_{c2_id}", 0), 2)
+            # Counter is by touched senders/day (for c2 there is one sender).
+            self.assertEqual(m.get_setting_int(db, f"recheck_counter_value_{c2_id}", 0), 1)
         finally:
             db.close()
 
         created_second = m.create_recheck_tasks_job()
         self.assertEqual(created_second, 0)
 
-    def test_create_recheck_tasks_job_limit_is_targets_per_day_not_raw_checks(self):
+    def test_create_recheck_tasks_job_limit_is_senders_per_day_not_raw_checks(self):
         m = self.main
         db = m.SessionLocal()
         try:
@@ -636,13 +637,13 @@ class TestMainAdditional(unittest.TestCase):
             db.close()
 
         created = m.create_recheck_tasks_job()
-        # One nick/day can spawn checks for all its senders.
-        self.assertEqual(created, 3)
+        # One sender/day should create checks only for one sender.
+        self.assertEqual(created, 1)
 
         db = m.SessionLocal()
         try:
             checks = db.query(m.Task).filter(m.Task.task_type == "check_status", m.Task.campaign_id == camp_id).all()
-            self.assertEqual(len(checks), 3)
+            self.assertEqual(len(checks), 1)
             self.assertEqual(m.get_setting_int(db, f"recheck_counter_value_{camp_id}", 0), 1)
         finally:
             db.close()

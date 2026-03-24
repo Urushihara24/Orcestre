@@ -3425,7 +3425,7 @@ INLINE_ACTION_TEXT = {
     "goal_jitter": "⏱️ Джиттер",
     "goal_windows": "🕐 Окна",
     "goal_target_limit": "🎯 На ник",
-    "goal_recheck_limit": "🔁 Ники на recheck",
+    "goal_recheck_limit": "🔁 Аккаунты на recheck",
     "goal_daily_repeat": "📅 Ежедневный повтор",
     "goal_send_algo": "🔀 Алгоритм отправки",
     "goal_sender_pick_mode": "🎲 Порядок отправителей",
@@ -3794,7 +3794,7 @@ def show_goal_edit_menu(chat_id: int):
         chat_id,
         f"✏️ Редактирование цели\n{label}\n"
         "Ключевой параметр: «🎯 На ник».\n"
-        "Остальное: окна, джиттер, алгоритм отправки, ники на recheck, ежедневный повтор.",
+        "Остальное: окна, джиттер, алгоритм отправки, аккаунты на recheck, ежедневный повтор.",
         reply_markup=kb_goal_edit_reply(),
         parse_mode=None,
         force_new=True,
@@ -5415,7 +5415,8 @@ def _nav_callback_text_map() -> dict[str, tuple[str, object]]:
         "📋 Ники цели": ("tgt_status", cb_tgt_status),
         "🚀 Распределить ники": ("tgt_distribute", cb_tgt_distribute),
         "🎯 На ник": ("set_target_senders", cb_set_target_senders),
-        "🔁 Ники на recheck": ("set_recheck_limit", cb_set_recheck_limit),
+        "🔁 Аккаунты на recheck": ("set_recheck_limit", cb_set_recheck_limit),
+        "🔁 Ники на recheck": ("set_recheck_limit", cb_set_recheck_limit),  # backward compatibility
         # backward compatibility for old keyboard text
         "🔁 Лимит повторных проверок": ("set_recheck_limit", cb_set_recheck_limit),
         "📅 Ежедневный повтор": ("set_daily_repeat", cb_set_daily_repeat),
@@ -5569,7 +5570,7 @@ def _format_campaign_info(db, c: Campaign) -> str:
         f"Джиттер: {c.jitter_min_sec}-{c.jitter_max_sec} сек\n"
         f"Алгоритм: {mode_ru}\n"
         f"Порядок отправителей: {sender_pick_ru}\n"
-        f"Ников на повторную проверку/сутки: {c.recheck_daily_limit}\n"
+        f"Аккаунтов-отправителей на recheck/сутки: {c.recheck_daily_limit}\n"
         f"Ежедневный повтор: {'включен' if c.daily_repeat_enabled else 'выключен'}"
     )
 
@@ -5648,8 +5649,8 @@ def handle_campaign_create_windows(message):
     CAMPAIGN_WIZARD_STATE[key] = st
     ask_step(
         message,
-        "Шаг 4/5. Сколько ников получателя перепроверять в сутки:\n"
-        "Для каждого выбранного ника будут проверены отправители этой цели.",
+        "Шаг 4/5. Сколько аккаунтов-отправителей перепроверять в сутки:\n"
+        "Для каждого выбранного аккаунта будут проверены его ники в этой цели.",
         handle_campaign_create_recheck,
     )
 
@@ -5665,7 +5666,7 @@ def handle_campaign_create_recheck(message):
     except Exception:
         show_screen(
             message.chat.id,
-            "❌ Нужно количество ников для recheck >= 0.",
+            "❌ Нужно количество аккаунтов для recheck >= 0.",
             reply_markup=kb_goal_manager_reply(),
             parse_mode=None,
             force_new=True,
@@ -7798,9 +7799,9 @@ def cb_set_recheck_limit(call):
     ask_step(
         dummy,
         f"Цель: {camp_name} (#{selected_campaign_id})\n"
-        f"Сейчас: {current} ников на повторную проверку/сутки\n\n"
-        "Введи число ников на повторную проверку в сутки (целое >= 0):\n"
-        "Для каждого выбранного ника будут проверены отправители этой цели.",
+        f"Сейчас: {current} аккаунтов-отправителей на recheck/сутки\n\n"
+        "Введи число аккаунтов-отправителей на recheck в сутки (целое >= 0):\n"
+        "Для каждого выбранного аккаунта будут проверены его ники этой цели.",
         handle_set_recheck_limit,
     )
 
@@ -7829,7 +7830,7 @@ def handle_set_recheck_limit(message):
     show_menu_status(
         message.chat.id,
         "targets",
-        f"✅ Ников на повторную проверку: {limit}/сутки (цель #{selected_campaign_id})",
+        f"✅ Аккаунтов-отправителей на recheck: {limit}/сутки (цель #{selected_campaign_id})",
     )
 
 
@@ -8134,8 +8135,8 @@ def create_recheck_tasks_job():
     """
     Плановое создание check_status задач для уже отправленных заявок.
     Идёт сверх ежедневной отправки send_request.
-    Лимит `recheck_daily_limit` трактуется как количество ников получателя в сутки:
-    для каждого выбранного ника проверяются отправители этой цели.
+    Лимит `recheck_daily_limit` трактуется как количество аккаунтов-отправителей в сутки:
+    для каждого выбранного аккаунта проверяются его ники в этой цели.
     """
 
     def _inner(db):
@@ -8145,52 +8146,55 @@ def create_recheck_tasks_job():
         total_created = 0
         total_counter_value = 0
 
-        # Per-goal counters/limits: each goal has its own recheck nick budget per day.
+        # Per-goal counters/limits: each goal has its own recheck sender budget per day.
         campaigns = db.query(Campaign).filter(Campaign.enabled == True).all()
         for camp in campaigns:
             camp_id = int(camp.id)
             day_key = f"recheck_counter_day_{camp_id}"
             val_key = f"recheck_counter_value_{camp_id}"
-            cursor_key = f"recheck_target_cursor_{camp_id}"
+            cursor_key = f"recheck_sender_cursor_{camp_id}"
             counter_day = get_setting(db, day_key, "")
             counter_val = get_setting_int(db, val_key, 0)
             if counter_day != today:
                 counter_day = today
                 counter_val = 0
 
-            daily_targets_limit = max(0, int(camp.recheck_daily_limit or DEFAULT_RECHECK_DAILY_LIMIT))
-            remaining_targets = max(0, daily_targets_limit - counter_val)
-            if remaining_targets <= 0:
+            daily_senders_limit = max(0, int(camp.recheck_daily_limit or DEFAULT_RECHECK_DAILY_LIMIT))
+            remaining_senders = max(0, daily_senders_limit - counter_val)
+            if remaining_senders <= 0:
                 set_setting(db, day_key, counter_day)
                 set_setting(db, val_key, str(counter_val))
                 continue
 
-            target_rows = (
-                db.query(Target.id, Target.username)
+            sender_rows = (
+                db.query(Task.account_id)
+                .join(Target, Target.id == Task.target_id)
                 .filter(
-                    target_campaign_filter(db, camp_id),
+                    Task.task_type == "send_request",
+                    Task.status == TaskStatus.DONE.value,
                     Target.status.in_(TARGET_RECHECK_ELIGIBLE_STATUSES),
+                    or_(Task.campaign_id == camp_id, and_(Task.campaign_id.is_(None), Target.campaign_id == camp_id)),
                 )
-                .order_by(Target.id.asc())
+                .distinct()
+                .order_by(Task.account_id.asc())
                 .all()
             )
-            if not target_rows:
+            if not sender_rows:
                 set_setting(db, day_key, counter_day)
                 set_setting(db, val_key, str(counter_val))
                 continue
 
-            target_total = len(target_rows)
+            sender_total = len(sender_rows)
             cursor = max(0, int(get_setting_int(db, cursor_key, 0)))
-            take = min(int(remaining_targets), int(target_total))
-            start_idx = int(cursor % max(1, target_total))
+            take = min(int(remaining_senders), int(sender_total))
+            start_idx = int(cursor % max(1, sender_total))
 
-            selected_targets = []
+            selected_senders = []
             for i in range(int(take)):
-                selected_targets.append(target_rows[(start_idx + i) % target_total])
-            set_setting(db, cursor_key, str((start_idx + take) % max(1, target_total)))
+                selected_senders.append(int(sender_rows[(start_idx + i) % sender_total][0]))
+            set_setting(db, cursor_key, str((start_idx + take) % max(1, sender_total)))
 
-            selected_target_ids = [int(tid) for tid, _ in selected_targets]
-            if not selected_target_ids:
+            if not selected_senders:
                 set_setting(db, day_key, counter_day)
                 set_setting(db, val_key, str(counter_val))
                 continue
@@ -8201,7 +8205,8 @@ def create_recheck_tasks_job():
                 .filter(
                     Task.task_type == "send_request",
                     Task.status == TaskStatus.DONE.value,
-                    Task.target_id.in_(selected_target_ids),
+                    Task.account_id.in_(selected_senders),
+                    Target.status.in_(TARGET_RECHECK_ELIGIBLE_STATUSES),
                     or_(Task.campaign_id == camp_id, and_(Task.campaign_id.is_(None), Target.campaign_id == camp_id)),
                 )
                 .order_by(Task.completed_at.desc().nullslast(), Task.id.desc())
@@ -8234,7 +8239,7 @@ def create_recheck_tasks_job():
 
             created = 0
             now = utc_now()
-            touched_targets: set[int] = set()
+            touched_senders: set[int] = set()
             for pair in ordered_pairs:
                 account_id = int(pair.account_id)
                 target_id = int(pair.target_id)
@@ -8273,10 +8278,10 @@ def create_recheck_tasks_job():
                     )
                 )
                 created += 1
-                touched_targets.add(target_id)
+                touched_senders.add(account_id)
 
-            # Counter tracks rechecked nicknames/day, not raw check tasks.
-            new_counter_val = counter_val + len(touched_targets)
+            # Counter tracks rechecked senders/day, not raw check tasks.
+            new_counter_val = counter_val + len(touched_senders)
             set_setting(db, day_key, counter_day)
             set_setting(db, val_key, str(new_counter_val))
             total_created += created
