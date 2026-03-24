@@ -222,6 +222,8 @@ PRECHECK_SKIP_REASONS = (
     "precheck_pending_skip",
     "precheck_accepted_skip_requeued",
     "precheck_pending_skip_requeued",
+    "idempotent_request_skip",
+    "idempotent_request_skip_requeued",
 )
 
 
@@ -2189,34 +2191,57 @@ def process_tasks_job():
                 if result.ok and result.code == "request_sent":
                     result_data = getattr(result, "data", None) or {}
                     was_idempotent = bool(result_data.get("note") == "idempotent_success")
-                    if not was_idempotent:
+                    if was_idempotent:
+                        # Epic returned idempotent success (already friends / already pending).
+                        # Do not count this as a new send for coverage; replace sender if needed.
+                        task.status = TaskStatus.CANCELLED.value
+                        task.completed_at = now
+                        req = target_required_senders(db, tgt)
+                        replaced = False
+                        if not is_recheck_resend:
+                            done_sender_ids = _done_sender_ids_for_target(db, int(tgt.id), camp, now)
+                            if len(done_sender_ids) < int(req):
+                                replaced = _enqueue_replacement_send_task(
+                                    db,
+                                    target=tgt,
+                                    camp=camp,
+                                    now=now,
+                                    excluded_ids={int(acc.id)},
+                                    source_reason="replacement_after_idempotent_send",
+                                )
+                        task.last_error = (
+                            "idempotent_request_skip_requeued" if replaced else "idempotent_request_skip"
+                        )
+                        acc.last_activity_at = now
+                        acc.last_error = None
+                    else:
                         acc.today_sent += 1
                         acc.total_sent += 1
-                    acc.last_activity_at = now
-                    acc.last_error = None
-                    tgt.sent_count += 1
-                    tgt.last_attempt_at = now
-                    tgt.attempt_count += 1
-                    req = target_required_senders(db, tgt)
-                    tgt.status = TargetStatus.SENT.value if int(tgt.sent_count or 0) >= req else TargetStatus.PENDING.value
-                    task.status = TaskStatus.DONE.value
-                    task.completed_at = now
+                        acc.last_activity_at = now
+                        acc.last_error = None
+                        tgt.sent_count += 1
+                        tgt.last_attempt_at = now
+                        tgt.attempt_count += 1
+                        req = target_required_senders(db, tgt)
+                        tgt.status = TargetStatus.SENT.value if int(tgt.sent_count or 0) >= req else TargetStatus.PENDING.value
+                        task.status = TaskStatus.DONE.value
+                        task.completed_at = now
 
-                    check_task = Task(
-                        task_type="check_status",
-                        status=TaskStatus.QUEUED.value,
-                        campaign_id=(int(camp.id) if camp is not None else None),
-                        account_id=acc.id,
-                        target_id=tgt.id,
-                        scheduled_for=now + timedelta(hours=2),
-                        max_attempts=5,
-                    )
-                    db.add(check_task)
+                        check_task = Task(
+                            task_type="check_status",
+                            status=TaskStatus.QUEUED.value,
+                            campaign_id=(int(camp.id) if camp is not None else None),
+                            account_id=acc.id,
+                            target_id=tgt.id,
+                            scheduled_for=now + timedelta(hours=2),
+                            max_attempts=5,
+                        )
+                        db.add(check_task)
 
-                    if acc.proxy_id:
-                        proxy = db.query(Proxy).filter(Proxy.id == acc.proxy_id).first()
-                        if proxy:
-                            proxy.success_count += 1
+                        if acc.proxy_id:
+                            proxy = db.query(Proxy).filter(Proxy.id == acc.proxy_id).first()
+                            if proxy:
+                                proxy.success_count += 1
                 else:
                     acc.total_failed += 1
                     acc.last_activity_at = now
@@ -5847,6 +5872,7 @@ def _create_manual_force_cycle_for_account(db, camp: Campaign, acc: Account) -> 
     skipped_active = 0
     skipped_done = 0
     skipped_connected = 0
+    replaced_connected = 0
 
     for t in targets:
         has_active = db.query(Task.id).filter(
@@ -5888,7 +5914,22 @@ def _create_manual_force_cycle_for_account(db, camp: Campaign, acc: Account) -> 
             ),
         ).first()
         if known_connected:
-            skipped_connected += 1
+            req = target_required_senders(db, t)
+            done_sender_ids = _done_sender_ids_for_target(db, int(t.id), camp, now)
+            replaced = False
+            if len(done_sender_ids) < int(req):
+                replaced = _enqueue_replacement_send_task(
+                    db,
+                    target=t,
+                    camp=camp,
+                    now=now,
+                    excluded_ids={int(acc.id)},
+                    source_reason="replacement_after_manual_connected",
+                )
+            if replaced:
+                replaced_connected += 1
+            else:
+                skipped_connected += 1
             continue
 
         db.add(
@@ -5913,6 +5954,7 @@ def _create_manual_force_cycle_for_account(db, camp: Campaign, acc: Account) -> 
         "skipped_active": int(skipped_active),
         "skipped_done": int(skipped_done),
         "skipped_connected": int(skipped_connected),
+        "replaced_connected": int(replaced_connected),
         "targets": int(len(targets)),
         "camp_name": str(camp.name),
     }
@@ -5959,6 +6001,7 @@ def handle_force_cycle_account(message):
         f"Создано задач: {res['created']}\n"
         f"Пропущено (уже в очереди): {res['skipped_active']}\n"
         f"Пропущено (уже отправлял): {res.get('skipped_done', 0)}\n"
+        f"Заменено на других отправителей: {res.get('replaced_connected', 0)}\n"
         f"Пропущено (уже в друзьях/ожидании): {res.get('skipped_connected', 0)}",
     )
 
@@ -6029,6 +6072,7 @@ def handle_force_cycle_random(message):
         f"Создано задач: {res['created']}\n"
         f"Пропущено (уже в очереди): {res['skipped_active']}\n"
         f"Пропущено (уже отправлял): {res.get('skipped_done', 0)}\n"
+        f"Заменено на других отправителей: {res.get('replaced_connected', 0)}\n"
         f"Пропущено (уже в друзьях/ожидании): {res.get('skipped_connected', 0)}",
     )
 

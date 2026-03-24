@@ -406,3 +406,110 @@ class TestBotCore(unittest.TestCase):
         finally:
             m.DRY_RUN = True
             m.SEND_REQUESTS_ENABLED = False
+
+    def test_idempotent_send_skips_coverage_and_requeues_replacement(self):
+        m = self.main
+        m.DRY_RUN = False
+        m.SEND_REQUESTS_ENABLED = True
+
+        db = m.SessionLocal()
+        try:
+            camp = m.Campaign(name="idempotent_replace", enabled=True, jitter_min_sec=0, jitter_max_sec=0)
+            db.add(camp)
+            db.flush()
+
+            acc1 = m.Account(
+                login="idem_a1@example.com",
+                password="x",
+                enabled=True,
+                status=m.AccountStatus.ACTIVE.value,
+                epic_account_id="ie1",
+                device_id="id1",
+                device_secret="is1",
+                daily_limit=100,
+                today_sent=0,
+                active_windows_json="[]",
+            )
+            acc2 = m.Account(
+                login="idem_a2@example.com",
+                password="x",
+                enabled=True,
+                status=m.AccountStatus.ACTIVE.value,
+                epic_account_id="ie2",
+                device_id="id2",
+                device_secret="is2",
+                daily_limit=100,
+                today_sent=0,
+                active_windows_json="[]",
+            )
+            db.add_all([acc1, acc2])
+            db.flush()
+
+            tgt = m.Target(
+                username="idem_target",
+                campaign_id=int(camp.id),
+                status=m.TargetStatus.PENDING.value,
+                required_senders=1,
+                sent_count=0,
+            )
+            db.add(tgt)
+            db.flush()
+
+            original = m.Task(
+                task_type="send_request",
+                status=m.TaskStatus.QUEUED.value,
+                campaign_id=int(camp.id),
+                account_id=int(acc1.id),
+                target_id=int(tgt.id),
+                scheduled_for=m.utc_now() - timedelta(seconds=1),
+                max_attempts=3,
+            )
+            db.add(original)
+            db.commit()
+            original_id = int(original.id)
+            acc2_id = int(acc2.id)
+            tgt_id = int(tgt.id)
+            camp_id = int(camp.id)
+        finally:
+            db.close()
+
+        # Pre-check doesn't classify as accepted/pending here.
+        m.check_friend_status_with_device = lambda **kw: SimpleNamespace(ok=False, code="unknown", message="none", data={})
+        # Epic returns idempotent request_sent (already friends/pending).
+        m.send_friend_request_with_device = lambda **kw: SimpleNamespace(
+            ok=True,
+            code="request_sent",
+            message="idempotent",
+            data={"note": "idempotent_success"},
+        )
+
+        try:
+            m.process_tasks_job()
+
+            db = m.SessionLocal()
+            try:
+                orig = db.query(m.Task).filter(m.Task.id == original_id).first()
+                self.assertEqual(orig.status, m.TaskStatus.CANCELLED.value)
+                self.assertEqual(orig.last_error, "idempotent_request_skip_requeued")
+
+                tgt = db.query(m.Target).filter(m.Target.id == tgt_id).first()
+                self.assertEqual(int(tgt.sent_count or 0), 0)
+
+                repl = (
+                    db.query(m.Task)
+                    .filter(
+                        m.Task.task_type == "send_request",
+                        m.Task.campaign_id == camp_id,
+                        m.Task.target_id == tgt_id,
+                        m.Task.account_id == acc2_id,
+                        m.Task.status == m.TaskStatus.QUEUED.value,
+                        m.Task.last_error == "replacement_after_idempotent_send",
+                    )
+                    .first()
+                )
+                self.assertIsNotNone(repl)
+            finally:
+                db.close()
+        finally:
+            m.DRY_RUN = True
+            m.SEND_REQUESTS_ENABLED = False
