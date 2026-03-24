@@ -218,6 +218,9 @@ def test_main_keyboards_are_inline(fresh_main):
     assert isinstance(m.kb_targets_reply(), m.types.InlineKeyboardMarkup)
     assert isinstance(m.kb_goal_manager_reply(), m.types.InlineKeyboardMarkup)
     assert isinstance(m.kb_goal_selected_reply(), m.types.InlineKeyboardMarkup)
+    assert isinstance(m.kb_goal_nicks_reply(), m.types.InlineKeyboardMarkup)
+    assert isinstance(m.kb_goal_sending_reply(), m.types.InlineKeyboardMarkup)
+    assert isinstance(m.kb_goal_ops_reply(), m.types.InlineKeyboardMarkup)
     assert isinstance(m.kb_goal_edit_reply(), m.types.InlineKeyboardMarkup)
     assert isinstance(m.kb_settings_reply(), m.types.InlineKeyboardMarkup)
     assert isinstance(m.kb_manage_reply(), m.types.InlineKeyboardMarkup)
@@ -495,13 +498,13 @@ def test_show_targets_status_and_campaign_progress(fresh_main, monkeypatch):
     status_text = fb.sent[-1][1]
     assert "🎯 **Ники цели" in status_text
     assert "Фильтр: `a`" in status_text
-    assert "Отправители: 1/2" in status_text
+    assert "Отправители (сегодня/лимит): 1/2" in status_text
 
     m.show_campaign_progress(chat_id)
     progress_text = fb.sent[-1][1]
     assert "📈 Прогресс текущей цели" in progress_text
     assert "Целей: 2" in progress_text
-    assert "Покрытие отправителей: 1/3" in progress_text
+    assert "Покрытие отправителей (всего): 1/3" in progress_text
     assert "Самый покрытый ник: 1/2 отправителей" in progress_text
     assert "Осталось до исчерпания пула: 1" in progress_text
 
@@ -580,6 +583,52 @@ def test_show_targets_receiver_stats_lists_per_nick_metrics(fresh_main, monkeypa
     assert "5/1/1/0" in txt
     assert "nick_b" in txt
     assert "3/0/0/1" in txt
+
+
+def test_goal_nicks_keyboard_uses_unified_page_arrows(fresh_main):
+    m = fresh_main
+    kb = m.kb_goal_nicks_reply()
+    texts = []
+    for row in kb.keyboard:
+        for btn in row:
+            texts.append(str(getattr(btn, "text", "")))
+    assert "◀️ Страница" in texts
+    assert "▶️ Страница" in texts
+    assert "◀️ Ники" not in texts
+    assert "▶️ Ники" not in texts
+    assert "◀️ Отправители" not in texts
+    assert "▶️ Отправители" not in texts
+
+
+def test_goal_selected_keyboard_is_grouped(fresh_main):
+    m = fresh_main
+    kb = m.kb_goal_selected_reply()
+    texts = []
+    for row in kb.keyboard:
+        for btn in row:
+            texts.append(str(getattr(btn, "text", "")))
+    assert "👥 Ники" in texts
+    assert "🚀 Отправка" in texts
+    assert "🧹 Операции" in texts
+
+
+def test_unified_page_arrows_route_to_senders_context(fresh_main, monkeypatch):
+    m = fresh_main
+    calls = []
+    monkeypatch.setattr(
+        m,
+        "show_target_senders_page",
+        lambda chat_id, target_id, page=1: calls.append((chat_id, target_id, page)),
+        raising=True,
+    )
+    chat_id = 2020
+    m.set_chat_ui_value(chat_id, "goal_page_context", "target_senders")
+    m.set_chat_ui_value(chat_id, "senders_target_id", 55)
+    m.set_chat_ui_value(chat_id, "senders_page", 3)
+
+    m.cmd_reply_nav(_msg(chat_id=chat_id, user_id=1, text="◀️ Страница"))
+    m.cmd_reply_nav(_msg(chat_id=chat_id, user_id=1, text="▶️ Страница"))
+    assert calls == [(chat_id, 55, 2), (chat_id, 55, 4)]
 
 
 def test_handle_targets_search_query_routes_by_current_view_mode(fresh_main, monkeypatch):

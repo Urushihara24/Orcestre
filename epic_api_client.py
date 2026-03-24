@@ -613,6 +613,70 @@ class EpicGamesAPIClient:
 
         return self._with_token_retry(_impl)
 
+    def change_display_name(self, new_display_name: str) -> ProviderResult:
+        """Сменить displayName текущего аккаунта."""
+        nickname = str(new_display_name or "").strip()
+        if not nickname:
+            return ProviderResult(False, "invalid_nickname", "Display name is required")
+
+        def _impl(access_token: str, account_id: str) -> ProviderResult:
+            url = f"{self.ACCOUNT_BASE}/account/api/public/account/{quote(account_id, safe='')}"
+            headers = {"Authorization": f"Bearer {access_token}"}
+            payload = {"displayName": nickname}
+            success, resp_data, error_code = self._make_request("PUT", url, headers=headers, data=payload)
+
+            if success:
+                applied_name = ""
+                if isinstance(resp_data, dict):
+                    applied_name = str(resp_data.get("displayName") or "").strip()
+                return ProviderResult(
+                    True,
+                    "display_name_changed",
+                    "Display name updated",
+                    data={"display_name": applied_name or nickname},
+                )
+
+            if error_code in ("unauthorized", "forbidden"):
+                return ProviderResult(False, "auth_failed", "Token invalid/expired or access denied")
+            if error_code == "rate_limited":
+                return ProviderResult(False, "rate_limited", "Rate limited while changing display name")
+
+            details = _format_epic_error_details(resp_data).lower()
+            msg = ""
+            if isinstance(resp_data, dict):
+                msg = (
+                    str(resp_data.get("errorMessage") or "")
+                    or str(resp_data.get("error_description") or "")
+                    or str(resp_data.get("error") or "")
+                )
+            low_msg = msg.lower()
+
+            if (
+                "display" in details and "already" in details
+                or "already in use" in low_msg
+                or "already used" in low_msg
+            ):
+                return ProviderResult(False, "nickname_taken", msg or "Display name is already used")
+            if "display" in details and ("cooldown" in details or "change" in details and "14" in details):
+                return ProviderResult(False, "nickname_cooldown", msg or "Display name can not be changed yet")
+            if "can only be changed" in low_msg or "14 day" in low_msg or "two weeks" in low_msg:
+                return ProviderResult(False, "nickname_cooldown", msg or "Display name can not be changed yet")
+            if (
+                "invalid" in low_msg
+                or "not allowed" in low_msg
+                or "display" in details and "invalid" in details
+            ):
+                return ProviderResult(False, "invalid_nickname", msg or "Invalid display name")
+
+            return ProviderResult(
+                False,
+                error_code,
+                msg or f"Change display name failed: {error_code}",
+                data=resp_data if isinstance(resp_data, dict) else None,
+            )
+
+        return self._with_token_retry(_impl)
+
     def send_friend_request(self, target_id: str) -> ProviderResult:
         """Отправить заявку в друзья (idempotent под бота)"""
         if not target_id:
@@ -994,6 +1058,31 @@ def remove_friend_with_device(
         if not user.data or "user_id" not in user.data:
             return ProviderResult(False, "invalid_response", "Failed to retrieve target user ID")
         return client.remove_friend(str(user.data["user_id"]))
+
+
+def change_display_name_with_device(
+    login: str,
+    password: str,
+    new_display_name: str,
+    proxy_url: Optional[str],
+    epic_account_id: Optional[str],
+    device_id: Optional[str],
+    device_secret: Optional[str],
+) -> ProviderResult:
+    """Сменить displayName аккаунта с опцией device_auth."""
+    if not all([login, password, new_display_name]):
+        return ProviderResult(False, "missing_params", "login, password, new_display_name are required")
+
+    with EpicGamesAPIClient(
+        login=login,
+        password=password,
+        proxy_url=proxy_url,
+        epic_account_id=epic_account_id or "",
+        device_id=device_id or "",
+        device_secret=device_secret or "",
+        allow_password_fallback=False,
+    ) as client:
+        return client.change_display_name(str(new_display_name))
 
 
 # ============================================================
