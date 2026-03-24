@@ -3420,6 +3420,7 @@ INLINE_ACTION_TEXT = {
     "goal_check_friends": "🔍 Проверить в друзьях",
     "goal_resend_missing": "🔁 Дослать отсутствующих",
     "goal_delete": "🗑️ Удалить цель",
+    # Legacy item, kept for backward compatibility with old inline messages.
     "goal_limit": "🔄 Лимит слоя",
     "goal_jitter": "⏱️ Джиттер",
     "goal_windows": "🕐 Окна",
@@ -3544,10 +3545,10 @@ def kb_goal_ops_reply() -> types.InlineKeyboardMarkup:
 
 def kb_goal_edit_reply() -> types.InlineKeyboardMarkup:
     m = types.InlineKeyboardMarkup(row_width=2)
-    m.add(_act_btn("goal_limit"), _act_btn("goal_jitter"))
-    m.add(_act_btn("goal_windows"), _act_btn("goal_target_limit"))
-    m.add(_act_btn("goal_recheck_limit"), _act_btn("goal_daily_repeat"))
-    m.add(_act_btn("goal_send_algo"), _act_btn("goal_sender_pick_mode"))
+    m.add(_act_btn("goal_target_limit"), _act_btn("goal_jitter"))
+    m.add(_act_btn("goal_windows"), _act_btn("goal_recheck_limit"))
+    m.add(_act_btn("goal_daily_repeat"), _act_btn("goal_send_algo"))
+    m.add(_act_btn("goal_sender_pick_mode"))
     m.add(_act_btn("goal_params"))
     m.add(_act_btn("back"))
     return m
@@ -3792,7 +3793,8 @@ def show_goal_edit_menu(chat_id: int):
     show_screen(
         chat_id,
         f"✏️ Редактирование цели\n{label}\n"
-        "Лимит слоя, окна, джиттер, алгоритм отправки, ники на recheck, ежедневный повтор.",
+        "Ключевой параметр: «🎯 На ник».\n"
+        "Остальное: окна, джиттер, алгоритм отправки, ники на recheck, ежедневный повтор.",
         reply_markup=kb_goal_edit_reply(),
         parse_mode=None,
         force_new=True,
@@ -4947,19 +4949,12 @@ def _handle_goal_edit_shortcuts(message, text: str, chat_id: int, current_menu: 
         return False
     if text in {"🔄 Лимит", "🔄 Лимит слоя"}:
         cid = get_selected_campaign_id(chat_id)
-        camp_info = db_exec(
-            lambda db: db.query(Campaign.name, Campaign.daily_limit_per_account).filter(Campaign.id == cid).first()
-        )
-        current_limit = int((camp_info[1] if camp_info else 0) or 0)
-        camp_name = (camp_info[0] if camp_info else f"#{cid}")
-        ask_step(
-            message,
-            f"Текущая цель: {camp_name} (#{cid})\n"
-            f"Сейчас базовый лимит: {current_limit}/сутки на 1 аккаунт\n"
-            "Примечание: для основной рассылки бот автоматически поднимет его до числа ников,\n"
-            "чтобы отправитель проходил весь список ников цели.\n\n"
-            "Введи новый лимит (>=1):",
-            handle_set_goal_daily_limit,
+        show_menu_status(
+            chat_id,
+            "goal_edit",
+            f"ℹ️ Для цели #{cid} ручной «лимит слоя» больше не настраивается.\n"
+            "Отправитель всегда проходит весь список ников цели.\n"
+            "Используй параметр «🎯 На ник» — сколько отправителей в сутки на каждый ник.",
         )
         return True
     if text == "⏱️ Джиттер":
@@ -5533,7 +5528,7 @@ def show_campaigns_list(chat_id: int):
         st = "🟢 активна" if c.enabled else "⏸️ остановлена"
         lines.append(
             f"№{idx} {c.name} (id:{c.id}) — {st}, целей={targets_cnt}, "
-            f"лимит/акк={c.daily_limit_per_account}, на цель={c.target_senders_count}"
+            f"на ник={c.target_senders_count}, слой=авто"
         )
     show_screen(chat_id, "\n".join(lines), reply_markup=kb_goal_manager_reply(), parse_mode=None, force_new=True)
 
@@ -5568,8 +5563,8 @@ def _format_campaign_info(db, c: Campaign) -> str:
         f"📄 Цель №{num}: {c.name} (id:{c.id})\n"
         f"Статус: {'активна' if c.enabled else 'остановлена'}\n"
         f"Целей: {targets_cnt}\n"
-        f"Базовый лимит/акк/сутки: {c.daily_limit_per_account}\n"
-        f"Отправителей на цель: {c.target_senders_count}\n"
+        f"Отправителей на ник/сутки: {c.target_senders_count}\n"
+        f"Покрытие слоя: авто (1 отправитель -> все ники цели)\n"
         f"Окна: {windows_human(c.active_windows_json or '[]')}\n"
         f"Джиттер: {c.jitter_min_sec}-{c.jitter_max_sec} сек\n"
         f"Алгоритм: {mode_ru}\n"
@@ -5586,32 +5581,28 @@ def handle_campaign_create_name(message):
         show_screen(message.chat.id, "❌ Имя не может быть пустым.", reply_markup=kb_goal_manager_reply(), parse_mode=None, force_new=True)
         return
     key = (message.chat.id, message.from_user.id)
-    CAMPAIGN_WIZARD_STATE[key] = {"name": name}
+    CAMPAIGN_WIZARD_STATE[key] = {
+        "name": name,
+        # Internal baseline; actual layer coverage is auto-sized by nick count.
+        "daily_limit_per_account": 1,
+    }
     ask_step(
         message,
-        "Шаг 2/6. Базовый лимит на 1 аккаунт-отправитель в сутки:\n"
-        "Бот автоматически поднимет его до числа ников цели, чтобы отправитель покрывал весь список.",
-        handle_campaign_create_daily_limit,
+        "Шаг 2/5. Сколько аккаунтов-отправителей на 1 ник получателя:",
+        handle_campaign_create_senders,
     )
 
 
 def handle_campaign_create_daily_limit(message):
+    # Backward compatibility for old wizard state/messages.
     cleanup_step(message)
     key = (message.chat.id, message.from_user.id)
     st = CAMPAIGN_WIZARD_STATE.get(key) or {}
-    try:
-        val = int((message.text or "").strip())
-        if val < 1:
-            raise ValueError()
-    except Exception:
-        show_screen(message.chat.id, "❌ Нужен положительный лимит.", reply_markup=kb_goal_manager_reply(), parse_mode=None, force_new=True)
-        CAMPAIGN_WIZARD_STATE.pop(key, None)
-        return
-    st["daily_limit_per_account"] = val
+    st["daily_limit_per_account"] = 1
     CAMPAIGN_WIZARD_STATE[key] = st
     ask_step(
         message,
-        "Шаг 3/6. Сколько аккаунтов-отправителей на 1 ник получателя:",
+        "Шаг 2/5. Сколько аккаунтов-отправителей на 1 ник получателя:",
         handle_campaign_create_senders,
     )
 
@@ -5632,7 +5623,7 @@ def handle_campaign_create_senders(message):
     CAMPAIGN_WIZARD_STATE[key] = st
     ask_step(
         message,
-        "Шаг 4/6. Окна работы цели.\n"
+        "Шаг 3/5. Окна работы цели.\n"
         "Введи `24/7` или несколько строк вида:\n"
         "`days=1,2,3,4,5 from=12:00 to=20:00`\n"
         "`days=6,7 from=10:00 to=18:00`",
@@ -5657,7 +5648,7 @@ def handle_campaign_create_windows(message):
     CAMPAIGN_WIZARD_STATE[key] = st
     ask_step(
         message,
-        "Шаг 5/6. Сколько ников получателя перепроверять в сутки:\n"
+        "Шаг 4/5. Сколько ников получателя перепроверять в сутки:\n"
         "Для каждого выбранного ника будут проверены отправители этой цели.",
         handle_campaign_create_recheck,
     )
@@ -5685,7 +5676,7 @@ def handle_campaign_create_recheck(message):
     CAMPAIGN_WIZARD_STATE[key] = st
     ask_step(
         message,
-        "Шаг 6/6. Ежедневный повтор цели.\n1 = да, 0 = нет.",
+        "Шаг 5/5. Ежедневный повтор цели.\n1 = да, 0 = нет.",
         handle_campaign_create_repeat,
     )
 
@@ -5764,45 +5755,16 @@ def _set_campaign_enabled(cid: int, enabled: bool) -> tuple[bool, str]:
 
 
 def handle_set_goal_daily_limit(message):
+    # Legacy handler (limit is now automatic by design).
     cleanup_step(message)
-    try:
-        limit = int((message.text or "").strip())
-        if limit < 1:
-            raise ValueError()
-    except Exception:
-        show_menu_status(message.chat.id, "targets", "❌ Нужен лимит >= 1")
-        return
-
     cid = get_selected_campaign_id(message.chat.id)
-
-    def _inner(db):
-        camp = get_campaign_or_default(db, cid)
-        if not camp:
-            return False, 0, "", 0, 0
-        prev = int(camp.daily_limit_per_account or 0)
-        camp.daily_limit_per_account = int(limit)
-        # Apply new per-goal daily limit immediately (do not wait next day cache rollover).
-        set_setting(db, f"camp_daily_limit_day_{int(camp.id)}", "")
-        set_setting(db, f"camp_daily_limit_val_{int(camp.id)}", str(int(limit)))
-        camp.updated_at = utc_now()
-        db.commit()
-        dropped_queue, created_tasks = rebuild_campaign_send_queue(db, int(camp.id), create_limit=5000)
-        return True, prev, camp.name, dropped_queue, created_tasks
-
-    ok, prev, camp_name, dropped_queue, created_tasks = db_exec(_inner)
-    if ok:
-        show_menu_status(
-            message.chat.id,
-            "targets",
-            f"✅ Базовый лимит цели «{camp_name}» обновлён:\n"
-            f"Было: {prev}/сутки\n"
-            f"Стало: {limit}/сутки на 1 аккаунт\n"
-            "Для основной рассылки бот автоматически доводит лимит до числа ников цели.\n"
-            f"Очищено старых задач: {dropped_queue}\n"
-            f"Добавлено недостающих задач: {created_tasks}",
-        )
-    else:
-        show_menu_status(message.chat.id, "targets", "❌ Цель не найдена")
+    show_menu_status(
+        message.chat.id,
+        "goal_edit",
+        f"ℹ️ Для цели #{cid} ручной лимит слоя отключен.\n"
+        "Отправитель автоматически покрывает весь список ников.\n"
+        "Настраивай только «🎯 На ник».",
+    )
 
 
 def handle_set_goal_jitter(message):
