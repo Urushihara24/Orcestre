@@ -577,6 +577,76 @@ class TestMainAdditional(unittest.TestCase):
         created_second = m.create_recheck_tasks_job()
         self.assertEqual(created_second, 0)
 
+    def test_create_recheck_tasks_job_limit_is_targets_per_day_not_raw_checks(self):
+        m = self.main
+        db = m.SessionLocal()
+        try:
+            now = m.utc_now()
+            camp = m.Campaign(name="goal_recheck_targets_limit", enabled=True, recheck_daily_limit=1, jitter_min_sec=0, jitter_max_sec=0)
+            db.add(camp)
+            db.commit()
+            db.refresh(camp)
+            camp_id = int(camp.id)
+
+            target = m.Target(
+                username="goal_recheck_targets_limit_nick",
+                campaign_id=camp_id,
+                status=m.TargetStatus.PENDING.value,
+                required_senders=3,
+            )
+            db.add(target)
+            db.commit()
+            db.refresh(target)
+            target_id = int(target.id)
+
+            accounts = []
+            for idx in range(3):
+                acc = m.Account(
+                    login=f"recheck_limit_acc_{idx}@example.com",
+                    password="x",
+                    enabled=True,
+                    status="active",
+                    epic_account_id=f"e{idx}",
+                    device_id=f"d{idx}",
+                    device_secret=f"s{idx}",
+                    daily_limit=500,
+                    today_sent=0,
+                    active_windows_json="[]",
+                )
+                accounts.append(acc)
+            db.add_all(accounts)
+            db.commit()
+            for acc in accounts:
+                db.refresh(acc)
+
+            for acc in accounts:
+                db.add(
+                    m.Task(
+                        task_type="send_request",
+                        status=m.TaskStatus.DONE.value,
+                        campaign_id=camp_id,
+                        account_id=int(acc.id),
+                        target_id=target_id,
+                        scheduled_for=now,
+                        completed_at=now,
+                    )
+                )
+            db.commit()
+        finally:
+            db.close()
+
+        created = m.create_recheck_tasks_job()
+        # One nick/day can spawn checks for all its senders.
+        self.assertEqual(created, 3)
+
+        db = m.SessionLocal()
+        try:
+            checks = db.query(m.Task).filter(m.Task.task_type == "check_status", m.Task.campaign_id == camp_id).all()
+            self.assertEqual(len(checks), 3)
+            self.assertEqual(m.get_setting_int(db, f"recheck_counter_value_{camp_id}", 0), 1)
+        finally:
+            db.close()
+
     def test_create_recheck_tasks_job_skips_disabled_goal(self):
         m = self.main
         db = m.SessionLocal()
