@@ -1560,10 +1560,17 @@ def test_handle_delete_goal_single_success_uses_goal_manager_status_screen(fresh
 def test_goal_edit_menu_routes_to_goal_specific_handlers(fresh_main, monkeypatch):
     m = fresh_main
     asked = []
+    status_calls = []
     monkeypatch.setattr(
         m,
         "ask_step",
         lambda message, prompt_text, next_handler, parse_mode=None: asked.append((prompt_text, next_handler.__name__)),
+        raising=True,
+    )
+    monkeypatch.setattr(
+        m,
+        "show_menu_status",
+        lambda chat_id, menu_key, text, *a, **k: status_calls.append((chat_id, menu_key, text)),
         raising=True,
     )
 
@@ -1574,6 +1581,8 @@ def test_goal_edit_menu_routes_to_goal_specific_handlers(fresh_main, monkeypatch
     m.cmd_reply_nav(_msg(chat_id=chat_id, text="⏱️ Джиттер"))
     m.cmd_reply_nav(_msg(chat_id=chat_id, text="🕐 Окна"))
 
-    assert asked[0][1] == "handle_set_goal_daily_limit"
-    assert asked[1][1] == "handle_set_goal_jitter"
-    assert asked[2][1] == "handle_set_goal_windows"
+    assert len(status_calls) == 1
+    assert status_calls[0][1] == "goal_edit"
+    assert "ручной" in status_calls[0][2].lower()
+    assert asked[0][1] == "handle_set_goal_jitter"
+    assert asked[1][1] == "handle_set_goal_windows"
