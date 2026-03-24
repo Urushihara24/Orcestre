@@ -1285,6 +1285,8 @@ def show_nickname_change_status(chat_id: int):
     lines.append("Статусы:")
     for key in status_order:
         lines.append(f"• {key}: {int(by_status.get(key, 0) or 0)}")
+    lines.append("")
+    lines.append("Подсказка: при nickname_taken бот пробует похожие варианты автоматически.")
     if rows:
         lines.append("")
         lines.append("Последние задания:")
@@ -3669,6 +3671,8 @@ def show_nickname_change_import_menu(chat_id: int):
         "Пришли файл .xlsx/.txt/.csv с 2 колонками:\n"
         "1) login/email аккаунта\n"
         "2) новый ник\n\n"
+        "Ограничения ника: 3-16, латиница/цифры/_.\n"
+        "Если ник занят, бот попробует похожие варианты автоматически.\n\n"
         "Примеры строк:\n"
         "mail@example.com;NewNick123\n"
         "mail2@example.com,NextNick_1",
