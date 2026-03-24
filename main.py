@@ -1799,7 +1799,10 @@ def create_tasks_for_new_targets(db, limit: int = 500, campaign_id: Optional[int
             intervals = _campaign_daily_intervals_utc(db, default_windows_json, now)
             total_window_sec = _window_total_seconds(intervals)
             elapsed_now_sec = _window_elapsed_seconds(intervals, now)
-            per_sender_daily = max(1, int(default_daily_limit_per_account))
+            targets_in_cycle = max(1, sum(1 for st in target_states if int(st["missing"]) > 0))
+            # UX rule: one sender should cover the whole nick list in its layer.
+            # Keep user limit as baseline, but never lower than number of nicks in current cycle.
+            per_sender_daily = max(1, int(default_daily_limit_per_account), int(targets_in_cycle))
             senders_count = max(1, len(ordered_accs))
             cycle_capacity = max(1, senders_count * per_sender_daily)
             auto_switch_gap_sec = max(1, total_window_sec // cycle_capacity)
@@ -3417,11 +3420,11 @@ INLINE_ACTION_TEXT = {
     "goal_check_friends": "🔍 Проверить в друзьях",
     "goal_resend_missing": "🔁 Дослать отсутствующих",
     "goal_delete": "🗑️ Удалить цель",
-    "goal_limit": "🔄 Лимит",
+    "goal_limit": "🔄 Лимит слоя",
     "goal_jitter": "⏱️ Джиттер",
     "goal_windows": "🕐 Окна",
     "goal_target_limit": "🎯 На ник",
-    "goal_recheck_limit": "🔁 Лимит повторных проверок",
+    "goal_recheck_limit": "🔁 Ники на recheck",
     "goal_daily_repeat": "📅 Ежедневный повтор",
     "goal_send_algo": "🔀 Алгоритм отправки",
     "goal_sender_pick_mode": "🎲 Порядок отправителей",
@@ -3789,7 +3792,7 @@ def show_goal_edit_menu(chat_id: int):
     show_screen(
         chat_id,
         f"✏️ Редактирование цели\n{label}\n"
-        "Лимит на аккаунт, окна, джиттер, алгоритм отправки, лимит повторных проверок, ежедневный повтор.",
+        "Лимит слоя, окна, джиттер, алгоритм отправки, ники на recheck, ежедневный повтор.",
         reply_markup=kb_goal_edit_reply(),
         parse_mode=None,
         force_new=True,
@@ -4942,7 +4945,7 @@ def _handle_auth_operator_nav(message, text: str, chat_id: int, callback_text_ma
 def _handle_goal_edit_shortcuts(message, text: str, chat_id: int, current_menu: str) -> bool:
     if current_menu != "goal_edit":
         return False
-    if text == "🔄 Лимит":
+    if text in {"🔄 Лимит", "🔄 Лимит слоя"}:
         cid = get_selected_campaign_id(chat_id)
         camp_info = db_exec(
             lambda db: db.query(Campaign.name, Campaign.daily_limit_per_account).filter(Campaign.id == cid).first()
@@ -4952,7 +4955,9 @@ def _handle_goal_edit_shortcuts(message, text: str, chat_id: int, current_menu: 
         ask_step(
             message,
             f"Текущая цель: {camp_name} (#{cid})\n"
-            f"Сейчас лимит: {current_limit}/сутки на 1 аккаунт\n\n"
+            f"Сейчас базовый лимит: {current_limit}/сутки на 1 аккаунт\n"
+            "Примечание: для основной рассылки бот автоматически поднимет его до числа ников,\n"
+            "чтобы отправитель проходил весь список ников цели.\n\n"
             "Введи новый лимит (>=1):",
             handle_set_goal_daily_limit,
         )
@@ -5415,6 +5420,8 @@ def _nav_callback_text_map() -> dict[str, tuple[str, object]]:
         "📋 Ники цели": ("tgt_status", cb_tgt_status),
         "🚀 Распределить ники": ("tgt_distribute", cb_tgt_distribute),
         "🎯 На ник": ("set_target_senders", cb_set_target_senders),
+        "🔁 Ники на recheck": ("set_recheck_limit", cb_set_recheck_limit),
+        # backward compatibility for old keyboard text
         "🔁 Лимит повторных проверок": ("set_recheck_limit", cb_set_recheck_limit),
         "📅 Ежедневный повтор": ("set_daily_repeat", cb_set_daily_repeat),
         "➕ Добавить прокси": ("proxy_add", cb_proxy_add),
@@ -5561,13 +5568,13 @@ def _format_campaign_info(db, c: Campaign) -> str:
         f"📄 Цель №{num}: {c.name} (id:{c.id})\n"
         f"Статус: {'активна' if c.enabled else 'остановлена'}\n"
         f"Целей: {targets_cnt}\n"
-        f"Лимит/акк/сутки: {c.daily_limit_per_account}\n"
+        f"Базовый лимит/акк/сутки: {c.daily_limit_per_account}\n"
         f"Отправителей на цель: {c.target_senders_count}\n"
         f"Окна: {windows_human(c.active_windows_json or '[]')}\n"
         f"Джиттер: {c.jitter_min_sec}-{c.jitter_max_sec} сек\n"
         f"Алгоритм: {mode_ru}\n"
         f"Порядок отправителей: {sender_pick_ru}\n"
-        f"Лимит повторных проверок: {c.recheck_daily_limit}\n"
+        f"Ников на повторную проверку/сутки: {c.recheck_daily_limit}\n"
         f"Ежедневный повтор: {'включен' if c.daily_repeat_enabled else 'выключен'}"
     )
 
@@ -5582,7 +5589,8 @@ def handle_campaign_create_name(message):
     CAMPAIGN_WIZARD_STATE[key] = {"name": name}
     ask_step(
         message,
-        "Шаг 2/6. Лимит на 1 аккаунт-отправитель в сутки:",
+        "Шаг 2/6. Базовый лимит на 1 аккаунт-отправитель в сутки:\n"
+        "Бот автоматически поднимет его до числа ников цели, чтобы отправитель покрывал весь список.",
         handle_campaign_create_daily_limit,
     )
 
@@ -5649,7 +5657,8 @@ def handle_campaign_create_windows(message):
     CAMPAIGN_WIZARD_STATE[key] = st
     ask_step(
         message,
-        "Шаг 5/6. Лимит повторных проверок в сутки:",
+        "Шаг 5/6. Сколько ников получателя перепроверять в сутки:\n"
+        "Для каждого выбранного ника будут проверены отправители этой цели.",
         handle_campaign_create_recheck,
     )
 
@@ -5663,7 +5672,13 @@ def handle_campaign_create_recheck(message):
         if val < 0:
             raise ValueError()
     except Exception:
-        show_screen(message.chat.id, "❌ Нужен лимит повторных проверок >= 0.", reply_markup=kb_goal_manager_reply(), parse_mode=None, force_new=True)
+        show_screen(
+            message.chat.id,
+            "❌ Нужно количество ников для recheck >= 0.",
+            reply_markup=kb_goal_manager_reply(),
+            parse_mode=None,
+            force_new=True,
+        )
         CAMPAIGN_WIZARD_STATE.pop(key, None)
         return
     st["recheck_daily_limit"] = val
@@ -5779,9 +5794,10 @@ def handle_set_goal_daily_limit(message):
         show_menu_status(
             message.chat.id,
             "targets",
-            f"✅ Лимит цели «{camp_name}» обновлён:\n"
+            f"✅ Базовый лимит цели «{camp_name}» обновлён:\n"
             f"Было: {prev}/сутки\n"
             f"Стало: {limit}/сутки на 1 аккаунт\n"
+            "Для основной рассылки бот автоматически доводит лимит до числа ников цели.\n"
             f"Очищено старых задач: {dropped_queue}\n"
             f"Добавлено недостающих задач: {created_tasks}",
         )
@@ -7820,9 +7836,9 @@ def cb_set_recheck_limit(call):
     ask_step(
         dummy,
         f"Цель: {camp_name} (#{selected_campaign_id})\n"
-        f"Сейчас лимит повторных проверок: {current}/сутки\n\n"
-        "Введи лимит повторных проверок в сутки (целое >= 0):\n"
-        "Это сколько старых заявок максимум перепроверять за день.",
+        f"Сейчас: {current} ников на повторную проверку/сутки\n\n"
+        "Введи число ников на повторную проверку в сутки (целое >= 0):\n"
+        "Для каждого выбранного ника будут проверены отправители этой цели.",
         handle_set_recheck_limit,
     )
 
@@ -7848,7 +7864,11 @@ def handle_set_recheck_limit(message):
         set_setting(db, "recheck_daily_limit", str(limit))
 
     db_exec(_inner)
-    show_menu_status(message.chat.id, "targets", f"✅ Лимит повторных проверок: {limit}/сутки (цель #{selected_campaign_id})")
+    show_menu_status(
+        message.chat.id,
+        "targets",
+        f"✅ Ников на повторную проверку: {limit}/сутки (цель #{selected_campaign_id})",
+    )
 
 
 @bot.callback_query_handler(func=lambda call: call.data == "set_daily_repeat")
@@ -8151,7 +8171,9 @@ def create_tasks_for_new_targets_job():
 def create_recheck_tasks_job():
     """
     Плановое создание check_status задач для уже отправленных заявок.
-    Идёт сверх ежедневной отправки send_request, но с отдельным суточным лимитом.
+    Идёт сверх ежедневной отправки send_request.
+    Лимит `recheck_daily_limit` трактуется как количество ников получателя в сутки:
+    для каждого выбранного ника проверяются отправители этой цели.
     """
 
     def _inner(db):
@@ -8161,21 +8183,52 @@ def create_recheck_tasks_job():
         total_created = 0
         total_counter_value = 0
 
-        # Per-goal counters/limits: each goal has its own recheck budget per day.
+        # Per-goal counters/limits: each goal has its own recheck nick budget per day.
         campaigns = db.query(Campaign).filter(Campaign.enabled == True).all()
         for camp in campaigns:
             camp_id = int(camp.id)
             day_key = f"recheck_counter_day_{camp_id}"
             val_key = f"recheck_counter_value_{camp_id}"
+            cursor_key = f"recheck_target_cursor_{camp_id}"
             counter_day = get_setting(db, day_key, "")
             counter_val = get_setting_int(db, val_key, 0)
             if counter_day != today:
                 counter_day = today
                 counter_val = 0
 
-            daily_limit = max(0, int(camp.recheck_daily_limit or DEFAULT_RECHECK_DAILY_LIMIT))
-            remaining = max(0, daily_limit - counter_val)
-            if remaining <= 0:
+            daily_targets_limit = max(0, int(camp.recheck_daily_limit or DEFAULT_RECHECK_DAILY_LIMIT))
+            remaining_targets = max(0, daily_targets_limit - counter_val)
+            if remaining_targets <= 0:
+                set_setting(db, day_key, counter_day)
+                set_setting(db, val_key, str(counter_val))
+                continue
+
+            target_rows = (
+                db.query(Target.id, Target.username)
+                .filter(
+                    target_campaign_filter(db, camp_id),
+                    Target.status.in_(TARGET_RECHECK_ELIGIBLE_STATUSES),
+                )
+                .order_by(Target.id.asc())
+                .all()
+            )
+            if not target_rows:
+                set_setting(db, day_key, counter_day)
+                set_setting(db, val_key, str(counter_val))
+                continue
+
+            target_total = len(target_rows)
+            cursor = max(0, int(get_setting_int(db, cursor_key, 0)))
+            take = min(int(remaining_targets), int(target_total))
+            start_idx = int(cursor % max(1, target_total))
+
+            selected_targets = []
+            for i in range(int(take)):
+                selected_targets.append(target_rows[(start_idx + i) % target_total])
+            set_setting(db, cursor_key, str((start_idx + take) % max(1, target_total)))
+
+            selected_target_ids = [int(tid) for tid, _ in selected_targets]
+            if not selected_target_ids:
                 set_setting(db, day_key, counter_day)
                 set_setting(db, val_key, str(counter_val))
                 continue
@@ -8186,11 +8239,10 @@ def create_recheck_tasks_job():
                 .filter(
                     Task.task_type == "send_request",
                     Task.status == TaskStatus.DONE.value,
-                    Target.status.in_(TARGET_RECHECK_ELIGIBLE_STATUSES),
+                    Task.target_id.in_(selected_target_ids),
                     or_(Task.campaign_id == camp_id, and_(Task.campaign_id.is_(None), Target.campaign_id == camp_id)),
                 )
                 .order_by(Task.completed_at.desc().nullslast(), Task.id.desc())
-                .limit(max(remaining * 5, 100))
                 .all()
             )
             send_mode = get_campaign_send_mode(db, camp_id)
@@ -8220,9 +8272,8 @@ def create_recheck_tasks_job():
 
             created = 0
             now = utc_now()
+            touched_targets: set[int] = set()
             for pair in ordered_pairs:
-                if created >= remaining:
-                    break
                 account_id = int(pair.account_id)
                 target_id = int(pair.target_id)
 
@@ -8260,8 +8311,10 @@ def create_recheck_tasks_job():
                     )
                 )
                 created += 1
+                touched_targets.add(target_id)
 
-            new_counter_val = counter_val + created
+            # Counter tracks rechecked nicknames/day, not raw check tasks.
+            new_counter_val = counter_val + len(touched_targets)
             set_setting(db, day_key, counter_day)
             set_setting(db, val_key, str(new_counter_val))
             total_created += created
