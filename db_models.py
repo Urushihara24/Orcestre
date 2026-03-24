@@ -121,6 +121,27 @@ class Task(Base):
     created_at = Column(DateTime, default=utc_now_naive)
 
 
+class NicknameChangeTask(Base):
+    __tablename__ = "nickname_change_tasks"
+    __table_args__ = (
+        Index("ix_nickname_change_tasks_status_scheduled_for", "status", "scheduled_for"),
+        Index("ix_nickname_change_tasks_account_status", "account_id", "status"),
+    )
+    id = Column(Integer, primary_key=True)
+    account_id = Column(Integer, nullable=False, index=True)
+    requested_nick = Column(String(32), nullable=False)
+    final_nick = Column(String(32))
+    status = Column(String(32), default="queued")
+    scheduled_for = Column(DateTime, default=utc_now_naive)
+    started_at = Column(DateTime)
+    completed_at = Column(DateTime)
+    attempt_number = Column(Integer, default=0)
+    max_attempts = Column(Integer, default=3)
+    source_file = Column(String(256))
+    last_error = Column(Text)
+    created_at = Column(DateTime, default=utc_now_naive)
+
+
 class LogEvent(Base):
     __tablename__ = "log_events"
     id = Column(Integer, primary_key=True)

@@ -299,3 +299,110 @@ class TestBotCore(unittest.TestCase):
             # Restore globals to avoid influencing other tests.
             m.DRY_RUN = True
             m.SEND_REQUESTS_ENABLED = False
+
+    def test_precheck_pending_skips_sender_from_coverage_and_requeues_replacement(self):
+        m = self.main
+        m.DRY_RUN = False
+        m.SEND_REQUESTS_ENABLED = True
+
+        db = m.SessionLocal()
+        try:
+            camp = m.Campaign(name="precheck_replace", enabled=True, jitter_min_sec=0, jitter_max_sec=0)
+            db.add(camp)
+            db.flush()
+
+            acc1 = m.Account(
+                login="a1@example.com",
+                password="x",
+                enabled=True,
+                status=m.AccountStatus.ACTIVE.value,
+                epic_account_id="e1",
+                device_id="d1",
+                device_secret="s1",
+                daily_limit=100,
+                today_sent=0,
+                active_windows_json="[]",
+            )
+            acc2 = m.Account(
+                login="a2@example.com",
+                password="x",
+                enabled=True,
+                status=m.AccountStatus.ACTIVE.value,
+                epic_account_id="e2",
+                device_id="d2",
+                device_secret="s2",
+                daily_limit=100,
+                today_sent=0,
+                active_windows_json="[]",
+            )
+            db.add_all([acc1, acc2])
+            db.flush()
+
+            tgt = m.Target(
+                username="pending_target",
+                campaign_id=int(camp.id),
+                status=m.TargetStatus.PENDING.value,
+                required_senders=1,
+                sent_count=0,
+            )
+            db.add(tgt)
+            db.flush()
+
+            original = m.Task(
+                task_type="send_request",
+                status=m.TaskStatus.QUEUED.value,
+                campaign_id=int(camp.id),
+                account_id=int(acc1.id),
+                target_id=int(tgt.id),
+                scheduled_for=m.utc_now() - timedelta(seconds=1),
+                max_attempts=3,
+            )
+            db.add(original)
+            db.commit()
+            original_id = int(original.id)
+            acc1_id = int(acc1.id)
+            acc2_id = int(acc2.id)
+            tgt_id = int(tgt.id)
+            camp_id = int(camp.id)
+        finally:
+            db.close()
+
+        def _precheck(**kw):
+            login = str(kw.get("login") or "")
+            if login == "a1@example.com":
+                return SimpleNamespace(ok=True, code="pending", message="already pending", data={})
+            return SimpleNamespace(ok=False, code="unknown", message="none", data={})
+
+        m.check_friend_status_with_device = _precheck
+        m.send_friend_request_with_device = lambda **kw: SimpleNamespace(ok=True, code="request_sent", message="ok", data={})
+
+        try:
+            m.process_tasks_job()
+
+            db = m.SessionLocal()
+            try:
+                orig = db.query(m.Task).filter(m.Task.id == original_id).first()
+                self.assertEqual(orig.status, m.TaskStatus.CANCELLED.value)
+                self.assertEqual(orig.last_error, "precheck_pending_skip_requeued")
+
+                tgt = db.query(m.Target).filter(m.Target.id == tgt_id).first()
+                self.assertEqual(int(tgt.sent_count or 0), 0)
+
+                repl = (
+                    db.query(m.Task)
+                    .filter(
+                        m.Task.task_type == "send_request",
+                        m.Task.campaign_id == camp_id,
+                        m.Task.target_id == tgt_id,
+                        m.Task.account_id == acc2_id,
+                        m.Task.status == m.TaskStatus.QUEUED.value,
+                        m.Task.last_error == "replacement_after_precheck_pending",
+                    )
+                    .first()
+                )
+                self.assertIsNotNone(repl)
+            finally:
+                db.close()
+        finally:
+            m.DRY_RUN = True
+            m.SEND_REQUESTS_ENABLED = False
