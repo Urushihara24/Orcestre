@@ -149,24 +149,95 @@ def test_sender_first_auto_raises_layer_limit_to_cover_all_nicks(fresh_main):
     finally:
         db.close()
 
-    created = m.db_exec(lambda db: m.create_tasks_for_new_targets(db, limit=100, campaign_id=int(camp_id)))
-    assert created == 2
+
+def test_sender_first_blocks_do_not_overlap_between_senders(fresh_main):
+    m = fresh_main
+    db = m.SessionLocal()
+    camp_id = 0
+    acc_ids = []
+    try:
+        now = m.utc_now()
+        camp = m.Campaign(
+            name="SenderBlockOrderGoal",
+            enabled=True,
+            daily_limit_per_account=10,
+            target_senders_count=3,
+            jitter_min_sec=7,
+            jitter_max_sec=7,
+            active_windows_json="[]",
+        )
+        db.add(camp)
+        db.commit()
+        db.refresh(camp)
+        camp_id = int(camp.id)
+
+        for i in range(3):
+            acc = m.Account(
+                login=f"order_a{i+1}@example.com",
+                password="x",
+                enabled=True,
+                status=m.AccountStatus.ACTIVE.value,
+                epic_account_id=f"oe{i+1}",
+                device_id=f"od{i+1}",
+                device_secret=f"os{i+1}",
+                daily_limit=10,
+                today_sent=0,
+                active_windows_json="[]",
+                warmup_until=now - timedelta(minutes=1),
+            )
+            db.add(acc)
+            db.flush()
+            acc_ids.append(int(acc.id))
+
+        db.add_all(
+            [
+                m.Target(
+                    username="order_nick_1",
+                    campaign_id=int(camp.id),
+                    status=m.TargetStatus.NEW.value,
+                    required_senders=3,
+                ),
+                m.Target(
+                    username="order_nick_2",
+                    campaign_id=int(camp.id),
+                    status=m.TargetStatus.NEW.value,
+                    required_senders=3,
+                ),
+            ]
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    created = m.db_exec(lambda db: m.create_tasks_for_new_targets(db, limit=500, campaign_id=int(camp_id)))
+    assert created == 6
 
     db = m.SessionLocal()
     try:
-        queued = (
+        rows = (
             db.query(m.Task)
             .filter(
                 m.Task.task_type == "send_request",
                 m.Task.status == m.TaskStatus.QUEUED.value,
                 m.Task.campaign_id == int(camp_id),
             )
-            .order_by(m.Task.target_id.asc())
+            .order_by(m.Task.scheduled_for.asc(), m.Task.id.asc())
             .all()
         )
-        assert len(queued) == 2
-        # One sender should cover the full nick list in a layer.
-        assert len({int(t.account_id) for t in queued}) == 1
-        assert int(queued[0].account_id) == int(acc1_id)
+        assert len(rows) == 6
+
+        per_acc = {}
+        for t in rows:
+            per_acc.setdefault(int(t.account_id), []).append(t.scheduled_for)
+
+        # Sender-first mode should assign one full nick layer per sender (2 nicks per sender here).
+        assert set(per_acc.keys()) == set(acc_ids)
+        assert all(len(v) == 2 for v in per_acc.values())
+
+        # No overlap between sender blocks:
+        # all tasks of sender#1 are scheduled not later than the first task of sender#2, etc.
+        a1, a2, a3 = acc_ids
+        assert max(per_acc[a1]) <= min(per_acc[a2])
+        assert max(per_acc[a2]) <= min(per_acc[a3])
     finally:
         db.close()

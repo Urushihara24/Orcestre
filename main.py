@@ -1809,9 +1809,11 @@ def create_tasks_for_new_targets(db, limit: int = 500, campaign_id: Optional[int
             # UX rule: one sender should cover the whole nick list in its layer.
             # Keep user limit as baseline, but never lower than number of nicks in current cycle.
             per_sender_daily = max(1, int(default_daily_limit_per_account), int(targets_in_cycle))
-            senders_count = max(1, len(ordered_accs))
-            cycle_capacity = max(1, senders_count * per_sender_daily)
-            auto_switch_gap_sec = max(1, total_window_sec // cycle_capacity)
+            avg_jitter_sec = max(1, (int(min_s) + int(max_s)) // 2)
+            # Gap between sender layers should depend on how many sender layers
+            # are required for current goal coverage, not on raw task capacity.
+            estimated_sender_layers = max(1, max(int(st["missing"]) for st in target_states))
+            auto_switch_gap_sec = max(1, total_window_sec // estimated_sender_layers)
             if switch_max_sec > 0:
                 auto_switch_gap_sec = max(auto_switch_gap_sec, switch_min_sec)
                 auto_switch_gap_sec = min(auto_switch_gap_sec, switch_max_sec)
@@ -1824,10 +1826,12 @@ def create_tasks_for_new_targets(db, limit: int = 500, campaign_id: Optional[int
                     auto_target_gap_sec = max(auto_target_gap_sec, switch_min_sec)
                     auto_target_gap_sec = min(auto_target_gap_sec, switch_max_sec)
                 used_target_blocks = 0
+                target_timeline_offset_sec = int(elapsed_now_sec)
                 for state in target_states:
                     if int(state["missing"]) <= 0:
                         continue
-                    block_start_offset = max(0, elapsed_now_sec + int(used_target_blocks * auto_target_gap_sec))
+                    desired_start_offset = max(0, elapsed_now_sec + int(used_target_blocks * auto_target_gap_sec))
+                    block_start_offset = max(int(target_timeline_offset_sec), int(desired_start_offset))
                     block_cursor_sec = 0
                     assigned_this_target = 0
                     for shift, acc in enumerate(ordered_accs):
@@ -1863,9 +1867,12 @@ def create_tasks_for_new_targets(db, limit: int = 500, campaign_id: Optional[int
                             last_used_shift = int(shift)
                     if assigned_this_target > 0:
                         used_target_blocks += 1
+                        # Keep strict non-overlap between consecutive target blocks.
+                        target_timeline_offset_sec = int(block_start_offset + max(1, block_cursor_sec + avg_jitter_sec))
             else:
                 # Sender-first mode: sender#1 -> all nicks, sender#2 -> all nicks.
                 used_sender_blocks = 0
+                sender_timeline_offset_sec = int(elapsed_now_sec)
                 for shift, acc in enumerate(ordered_accs):
                     if all(int(st["missing"]) <= 0 for st in target_states):
                         break
@@ -1881,7 +1888,10 @@ def create_tasks_for_new_targets(db, limit: int = 500, campaign_id: Optional[int
                     if sender_capacity <= 0:
                         continue
 
-                    block_start_offset = max(0, elapsed_now_sec + int(used_sender_blocks * auto_switch_gap_sec))
+                    desired_start_offset = max(0, elapsed_now_sec + int(used_sender_blocks * auto_switch_gap_sec))
+                    # Enforce strict layer order: next sender starts only after
+                    # previous sender block is fully scheduled.
+                    block_start_offset = max(int(sender_timeline_offset_sec), int(desired_start_offset))
                     block_cursor_sec = 0
                     assigned_this_sender = 0
 
@@ -1916,6 +1926,7 @@ def create_tasks_for_new_targets(db, limit: int = 500, campaign_id: Optional[int
 
                     if assigned_this_sender > 0:
                         used_sender_blocks += 1
+                        sender_timeline_offset_sec = int(block_start_offset + max(1, block_cursor_sec + avg_jitter_sec))
             next_cursor = (start_idx + last_used_shift + 1) % len(valid_accs)
             set_setting(db, sender_cursor_key, str(int(next_cursor)))
     else:
