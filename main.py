@@ -1389,7 +1389,13 @@ def pick_best_account(db) -> Optional[Account]:
     return valid[0]
 
 
-def _done_sender_ids_for_target(db, target_id: int, camp: Optional[Campaign], now: datetime) -> set[int]:
+def _done_sender_ids_for_target(
+    db,
+    target_id: int,
+    camp: Optional[Campaign],
+    now: datetime,
+    force_daily_repeat: bool = False,
+) -> set[int]:
     """
     Covered senders for target.
     Includes:
@@ -1414,7 +1420,7 @@ def _done_sender_ids_for_target(db, target_id: int, camp: Optional[Campaign], no
         Task.last_error.in_(["friend_status:accepted", "friend_status:pending"]),
     )
 
-    if camp is not None and bool(camp.daily_repeat_enabled):
+    if (camp is not None and bool(camp.daily_repeat_enabled)) or bool(force_daily_repeat):
         day_start_utc, day_end_utc = local_day_bounds_utc_naive(db, now)
         send_done_q = send_done_q.filter(Task.completed_at >= day_start_utc, Task.completed_at < day_end_utc)
         send_connected_q = send_connected_q.filter(Task.completed_at >= day_start_utc, Task.completed_at < day_end_utc)
@@ -1669,26 +1675,26 @@ def create_tasks_for_new_targets(db, limit: int = 500, campaign_id: Optional[int
         if repeat_daily:
             # Daily repeat: cap is per local day.
             # Next day planner should be able to pick next senders again.
-            done_today_assigned_accounts = {
-                int(x[0]) for x in db.query(Task.account_id).filter(
-                    Task.target_id == t.id,
-                    Task.task_type == "send_request",
-                    Task.status == TaskStatus.DONE.value,
-                    Task.completed_at >= day_start_utc,
-                    Task.completed_at < day_end_utc,
-                ).distinct().all()
-            }
-            assigned_accounts = active_assigned_accounts | done_today_assigned_accounts
+            covered_today_assigned_accounts = _done_sender_ids_for_target(
+                db,
+                int(t.id),
+                camp_for_cfg,
+                now,
+                force_daily_repeat=bool(repeat_daily),
+            )
+            assigned_accounts = active_assigned_accounts | covered_today_assigned_accounts
             skipped_accounts = _precheck_skipped_sender_ids_for_target(db, int(t.id), camp_for_cfg, now)
         else:
             # Non-repeat mode: lifetime cap for sender uniqueness per target.
-            assigned_accounts = {
+            historical_assigned_accounts = {
                 int(x[0]) for x in db.query(Task.account_id).filter(
                     Task.target_id == t.id,
                     Task.task_type == "send_request",
                     Task.status != TaskStatus.CANCELLED.value,
                 ).distinct().all()
             }
+            covered_assigned_accounts = _done_sender_ids_for_target(db, int(t.id), camp_for_cfg, now)
+            assigned_accounts = historical_assigned_accounts | covered_assigned_accounts
             skipped_accounts = _precheck_skipped_sender_ids_for_target(db, int(t.id), camp_for_cfg, now)
         missing = required - len(assigned_accounts)
         if missing <= 0:
