@@ -704,14 +704,17 @@ class EpicGamesAPIClient:
             accept_invites = ""
             if isinstance(resp_data, dict):
                 mutual = str(resp_data.get("mutualPrivacy") or "").strip().upper()
-                accept_invites = str(resp_data.get("acceptInvites") or "").strip()
-            level_map = {
-                "ALL": "PUBLIC",
-                "FRIENDS_OF_FRIENDS": "FRIENDS_ONLY",
-                "FRIENDS": "FRIENDS_ONLY",
-                "NO_ONE": "PRIVATE",
-            }
-            level = level_map.get(mutual, "UNKNOWN")
+                accept_invites = str(resp_data.get("acceptInvites") or "").strip().lower()
+
+            if accept_invites == "private":
+                level = "PRIVATE"
+            elif mutual in {"FRIENDS", "FRIENDS_OF_FRIENDS"}:
+                level = "FRIENDS_ONLY"
+            elif accept_invites == "public":
+                level = "PUBLIC"
+            else:
+                level = "UNKNOWN"
+
             return ProviderResult(
                 True,
                 "privacy_settings_fetched",
@@ -734,12 +737,12 @@ class EpicGamesAPIClient:
         if lvl not in {"PUBLIC", "FRIENDS_ONLY", "PRIVATE"}:
             return ProviderResult(False, "invalid_privacy_level", "Supported values: PUBLIC, FRIENDS_ONLY, PRIVATE")
         _ = str(namespace or "").strip() or "Fortnite"  # backward-compatible signature
-        level_to_mutual = {
-            "PUBLIC": "ALL",
-            "FRIENDS_ONLY": "FRIENDS",
-            "PRIVATE": "NO_ONE",
-        }
-        target_mutual = str(level_to_mutual.get(lvl) or "")
+
+        # Epic endpoint /friends/.../settings реально применяет acceptInvites (public/private).
+        # mutualPrivacy принимает значение, но у большинства аккаунтов остаётся ALL.
+        # Поэтому FRIENDS_ONLY недоступен как отдельный устойчивый режим через публичный API.
+        target_accept_invites = "public" if lvl == "PUBLIC" else "private"
+        requested_friends_only = lvl == "FRIENDS_ONLY"
 
         def _impl(access_token: str, account_id: str) -> ProviderResult:
             url = f"{self.FRIENDS_BASE}/friends/api/v1/{quote(account_id, safe='')}/settings"
@@ -761,24 +764,82 @@ class EpicGamesAPIClient:
                     )
                 return ProviderResult(False, get_code, msg or f"Read current settings failed: {get_code}")
 
-            accept_invites = "public"
+            current_mutual = "ALL"
             if isinstance(get_data, dict):
-                accept_invites = str(get_data.get("acceptInvites") or "public").strip() or "public"
+                current_mutual = str(get_data.get("mutualPrivacy") or "ALL").strip().upper() or "ALL"
 
             payload = {
-                "acceptInvites": accept_invites,
-                "mutualPrivacy": target_mutual,
+                "acceptInvites": target_accept_invites,
+                "mutualPrivacy": current_mutual,
             }
             success, resp_data, error_code = self._make_request("PUT", url, headers=headers, json=payload)
             if success:
+                # Verify persisted value to avoid false positive "updated".
+                read_ok, read_data, read_code = self._make_request("GET", url, headers=headers)
+                if not read_ok:
+                    if read_code in ("unauthorized", "forbidden"):
+                        return ProviderResult(False, "auth_failed", "Token invalid/expired or access denied")
+                    if read_code == "rate_limited":
+                        return ProviderResult(False, "rate_limited", "Rate limited while verifying privacy settings")
+                    msg = ""
+                    if isinstance(read_data, dict):
+                        msg = (
+                            str(read_data.get("errorMessage") or "")
+                            or str(read_data.get("error_description") or "")
+                            or str(read_data.get("error") or "")
+                        )
+                    return ProviderResult(False, read_code, msg or f"Verify privacy settings failed: {read_code}")
+
+                actual_accept = ""
+                actual_mutual = ""
+                if isinstance(read_data, dict):
+                    actual_accept = str(read_data.get("acceptInvites") or "").strip().lower()
+                    actual_mutual = str(read_data.get("mutualPrivacy") or "").strip().upper()
+
+                if actual_accept == "private":
+                    effective_level = "PRIVATE"
+                elif actual_mutual in {"FRIENDS", "FRIENDS_OF_FRIENDS"}:
+                    effective_level = "FRIENDS_ONLY"
+                elif actual_accept == "public":
+                    effective_level = "PUBLIC"
+                else:
+                    effective_level = "UNKNOWN"
+
+                if actual_accept != target_accept_invites:
+                    return ProviderResult(
+                        False,
+                        "privacy_not_applied",
+                        "Privacy setting was not applied by Epic API",
+                        data={
+                            "requested_level": lvl,
+                            "effective_level": effective_level,
+                            "accept_invites": actual_accept,
+                            "mutual_privacy": actual_mutual,
+                        },
+                    )
+
+                if requested_friends_only:
+                    return ProviderResult(
+                        True,
+                        "privacy_settings_updated_limited",
+                        "Friends-only mode is not available via Epic public API. Applied closest mode: PRIVATE.",
+                        data={
+                            "requested_level": lvl,
+                            "effective_level": effective_level,
+                            "accept_invites": actual_accept,
+                            "mutual_privacy": actual_mutual,
+                        },
+                    )
+
                 return ProviderResult(
                     True,
                     "privacy_settings_updated",
                     "Privacy settings updated",
                     data={
-                        "level": lvl,
-                        "mutual_privacy": target_mutual,
-                        "accept_invites": accept_invites,
+                        "requested_level": lvl,
+                        "effective_level": effective_level,
+                        "accept_invites": actual_accept,
+                        "mutual_privacy": actual_mutual,
                     },
                 )
 
