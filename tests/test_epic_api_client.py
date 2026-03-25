@@ -140,22 +140,25 @@ class TestEpicApiClient(unittest.TestCase):
         def passthrough(fn):
             return fn("TOKEN", "ME")
 
-        captured = {}
+        calls = []
 
         def _req(method, url, **kwargs):
-            captured["method"] = method
-            captured["url"] = url
-            captured["json"] = kwargs.get("json")
-            return True, {"privacySettings": {"playRegion": "PRIVATE", "languages": "PRIVATE", "badges": "PRIVATE"}}, "ok"
+            calls.append((method, url, kwargs.get("json")))
+            if method == "GET":
+                return True, {"acceptInvites": "public", "mutualPrivacy": "ALL"}, "ok"
+            return True, {"acceptInvites": "public"}, "ok"
 
         with mock.patch.object(client, "_with_token_retry", side_effect=passthrough):
             with mock.patch.object(client, "_make_request", side_effect=_req):
                 r = client.set_profile_privacy_level("PRIVATE")
                 self.assertTrue(r.ok)
                 self.assertEqual(r.code, "privacy_settings_updated")
-                self.assertEqual(captured["method"], "POST")
-                self.assertIn("/profile/privacy_settings", captured["url"])
-                self.assertEqual((captured["json"] or {}).get("namespace"), "Fortnite")
+                self.assertEqual(len(calls), 2)
+                self.assertEqual(calls[0][0], "GET")
+                self.assertEqual(calls[1][0], "PUT")
+                self.assertIn("/friends/api/v1/ME/settings", calls[0][1])
+                self.assertIn("/friends/api/v1/ME/settings", calls[1][1])
+                self.assertEqual((calls[1][2] or {}).get("mutualPrivacy"), "NO_ONE")
 
     def test_set_profile_privacy_level_rejects_invalid_value(self):
         import epic_api_client as c

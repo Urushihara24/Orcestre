@@ -679,15 +679,13 @@ class EpicGamesAPIClient:
         return self._with_token_retry(_impl)
 
     def get_profile_privacy_settings(self, namespace: str = "Fortnite") -> ProviderResult:
-        """Получить настройки приватности профиля."""
-        ns = str(namespace or "").strip() or "Fortnite"
+        """Получить настройки приватности из friends settings."""
+        _ = str(namespace or "").strip() or "Fortnite"  # backward-compatible signature
 
         def _impl(access_token: str, account_id: str) -> ProviderResult:
-            url = f"{self.GLOBAL_PROFILE_BASE}/profile/privacy_settings"
+            url = f"{self.FRIENDS_BASE}/friends/api/v1/{quote(account_id, safe='')}/settings"
             headers = {"Authorization": f"Bearer {access_token}"}
-            payload = {"namespace": ns}
-
-            success, resp_data, error_code = self._make_request("PUT", url, headers=headers, json=payload)
+            success, resp_data, error_code = self._make_request("GET", url, headers=headers)
             if not success:
                 if error_code in ("unauthorized", "forbidden"):
                     return ProviderResult(False, "auth_failed", "Token invalid/expired or access denied")
@@ -700,18 +698,29 @@ class EpicGamesAPIClient:
                         or str(resp_data.get("error_description") or "")
                         or str(resp_data.get("error") or "")
                     )
-                return ProviderResult(False, error_code, msg or f"Read privacy settings failed: {error_code}")
+                return ProviderResult(False, error_code, msg or f"Read friends settings failed: {error_code}")
 
-            settings = {}
+            mutual = ""
+            accept_invites = ""
             if isinstance(resp_data, dict):
-                ps = resp_data.get("privacySettings")
-                if isinstance(ps, dict):
-                    settings = ps
+                mutual = str(resp_data.get("mutualPrivacy") or "").strip().upper()
+                accept_invites = str(resp_data.get("acceptInvites") or "").strip()
+            level_map = {
+                "ALL": "PUBLIC",
+                "FRIENDS_OF_FRIENDS": "FRIENDS_ONLY",
+                "FRIENDS": "FRIENDS_ONLY",
+                "NO_ONE": "PRIVATE",
+            }
+            level = level_map.get(mutual, "UNKNOWN")
             return ProviderResult(
                 True,
                 "privacy_settings_fetched",
                 "Privacy settings fetched",
-                data={"namespace": ns, "privacy_settings": settings},
+                data={
+                    "level": level,
+                    "mutual_privacy": mutual,
+                    "accept_invites": accept_invites,
+                },
             )
 
         return self._with_token_retry(_impl)
@@ -724,62 +733,72 @@ class EpicGamesAPIClient:
         lvl = str(level or "").strip().upper()
         if lvl not in {"PUBLIC", "FRIENDS_ONLY", "PRIVATE"}:
             return ProviderResult(False, "invalid_privacy_level", "Supported values: PUBLIC, FRIENDS_ONLY, PRIVATE")
-        ns = str(namespace or "").strip() or "Fortnite"
+        _ = str(namespace or "").strip() or "Fortnite"  # backward-compatible signature
+        level_to_mutual = {
+            "PUBLIC": "ALL",
+            "FRIENDS_ONLY": "FRIENDS",
+            "PRIVATE": "NO_ONE",
+        }
+        target_mutual = str(level_to_mutual.get(lvl) or "")
 
         def _impl(access_token: str, account_id: str) -> ProviderResult:
-            url = f"{self.GLOBAL_PROFILE_BASE}/profile/privacy_settings"
+            url = f"{self.FRIENDS_BASE}/friends/api/v1/{quote(account_id, safe='')}/settings"
             headers = {"Authorization": f"Bearer {access_token}"}
-            settings = {
-                "playRegion": lvl,
-                "languages": lvl,
-                "badges": lvl,
-            }
-            # Different backends/versions may expect snake_case or camelCase key.
-            payloads = [
-                {"namespace": ns, "privacy_settings": settings},
-                {"namespace": ns, "privacySettings": settings},
-            ]
 
-            last_resp_data = None
-            last_error_code = "unknown_error"
-            for i, payload in enumerate(payloads):
-                success, resp_data, error_code = self._make_request("POST", url, headers=headers, json=payload)
-                if success:
-                    applied = settings
-                    if isinstance(resp_data, dict):
-                        ps = resp_data.get("privacySettings")
-                        if isinstance(ps, dict) and ps:
-                            applied = ps
-                    return ProviderResult(
-                        True,
-                        "privacy_settings_updated",
-                        "Privacy settings updated",
-                        data={"namespace": ns, "privacy_settings": applied, "level": lvl},
+            # Preserve acceptInvites while changing only visibility mode.
+            get_ok, get_data, get_code = self._make_request("GET", url, headers=headers)
+            if not get_ok:
+                if get_code in ("unauthorized", "forbidden"):
+                    return ProviderResult(False, "auth_failed", "Token invalid/expired or access denied")
+                if get_code == "rate_limited":
+                    return ProviderResult(False, "rate_limited", "Rate limited while reading current settings")
+                msg = ""
+                if isinstance(get_data, dict):
+                    msg = (
+                        str(get_data.get("errorMessage") or "")
+                        or str(get_data.get("error_description") or "")
+                        or str(get_data.get("error") or "")
                     )
-                last_resp_data = resp_data
-                last_error_code = error_code
-                # Try fallback payload only for malformed input-style failures.
-                if i == 0 and error_code in {"bad_request", "invalid_response"}:
-                    continue
-                break
+                return ProviderResult(False, get_code, msg or f"Read current settings failed: {get_code}")
 
-            if last_error_code in ("unauthorized", "forbidden"):
+            accept_invites = "public"
+            if isinstance(get_data, dict):
+                accept_invites = str(get_data.get("acceptInvites") or "public").strip() or "public"
+
+            payload = {
+                "acceptInvites": accept_invites,
+                "mutualPrivacy": target_mutual,
+            }
+            success, resp_data, error_code = self._make_request("PUT", url, headers=headers, json=payload)
+            if success:
+                return ProviderResult(
+                    True,
+                    "privacy_settings_updated",
+                    "Privacy settings updated",
+                    data={
+                        "level": lvl,
+                        "mutual_privacy": target_mutual,
+                        "accept_invites": accept_invites,
+                    },
+                )
+
+            if error_code in ("unauthorized", "forbidden"):
                 return ProviderResult(False, "auth_failed", "Token invalid/expired or access denied")
-            if last_error_code == "rate_limited":
+            if error_code == "rate_limited":
                 return ProviderResult(False, "rate_limited", "Rate limited while updating privacy settings")
 
             msg = ""
-            if isinstance(last_resp_data, dict):
+            if isinstance(resp_data, dict):
                 msg = (
-                    str(last_resp_data.get("errorMessage") or "")
-                    or str(last_resp_data.get("error_description") or "")
-                    or str(last_resp_data.get("error") or "")
+                    str(resp_data.get("errorMessage") or "")
+                    or str(resp_data.get("error_description") or "")
+                    or str(resp_data.get("error") or "")
                 )
             return ProviderResult(
                 False,
-                last_error_code,
-                msg or f"Update privacy settings failed: {last_error_code}",
-                data=last_resp_data if isinstance(last_resp_data, dict) else None,
+                error_code,
+                msg or f"Update friends settings failed: {error_code}",
+                data=resp_data if isinstance(resp_data, dict) else None,
             )
 
         return self._with_token_retry(_impl)

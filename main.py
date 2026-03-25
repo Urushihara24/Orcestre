@@ -4544,8 +4544,8 @@ def show_account_privacy_menu(chat_id: int, account_id: int, status_note: str = 
 
     lines = [
         "🔒 Конфиденциальность профиля",
-        f"Аккаунт: {md_inline_code(row['label'])}",
-        f"Логин: {md_inline_code(row['login'])}",
+        f"Аккаунт: {row['label']}",
+        f"Логин: {row['login']}",
         f"Статус: {'активен' if row['enabled'] and row['status'] == AccountStatus.ACTIVE.value else row['status']}",
         f"Device auth: {'есть' if row['has_da'] else 'нет'}",
         "",
@@ -4561,7 +4561,7 @@ def show_account_privacy_menu(chat_id: int, account_id: int, status_note: str = 
         chat_id,
         "\n".join(lines),
         reply_markup=kb_account_privacy_one_reply(int(account_id)),
-        parse_mode="Markdown",
+        parse_mode=None,
         force_new=True,
     )
 
@@ -7397,7 +7397,7 @@ def handle_mass_privacy_mode(message):
         "1,2,3\n"
         "mail1@example.com;mail2@example.com",
         handle_mass_privacy_accounts,
-        parse_mode="Markdown",
+        parse_mode=None,
     )
 
 
