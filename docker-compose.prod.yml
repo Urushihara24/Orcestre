@@ -36,9 +36,9 @@ services:
       # When running in Docker, DB is reachable by service name.
       DB_URL: postgresql+psycopg://egs_user:egs_pass@postgres:5432/egs_bot
       APP_MODE: all
-      # Keep safe defaults for production bring-up; change consciously.
-      DRY_RUN: "0"
-      SEND_REQUESTS_ENABLED: "1"
+      # Runtime switches can be controlled from .env (safe fallback defaults below).
+      DRY_RUN: ${DRY_RUN:-0}
+      SEND_REQUESTS_ENABLED: ${SEND_REQUESTS_ENABLED:-0}
     volumes:
       - /tmp:/tmp
     healthcheck:

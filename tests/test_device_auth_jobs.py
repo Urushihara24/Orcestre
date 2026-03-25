@@ -12,11 +12,13 @@ def _fresh_import(module_name: str):
 def test_device_auth_jobs_disabled_returns_zero(tmp_path, monkeypatch):
     db_path = tmp_path / "job.db"
     monkeypatch.setenv("DB_URL", f"sqlite:///{db_path}")
+    monkeypatch.setenv("DB_AUTO_INIT_ON_IMPORT", "0")
     monkeypatch.setenv("ALLOW_PASSWORD_DEVICE_AUTH_BATCH", "0")
 
     # ensure DB models are created on this DB
     sys.modules.pop("db_models", None)
     import db_models  # noqa: F401
+    db_models.init_db_schema(run_migrations=True)
 
     jobs = _fresh_import("device_auth_jobs")
     s, f = jobs.generate_device_auth_for_missing_accounts(max_per_run=5)
@@ -26,10 +28,12 @@ def test_device_auth_jobs_disabled_returns_zero(tmp_path, monkeypatch):
 def test_device_auth_jobs_writes_device_auth(tmp_path, monkeypatch):
     db_path = tmp_path / "job2.db"
     monkeypatch.setenv("DB_URL", f"sqlite:///{db_path}")
+    monkeypatch.setenv("DB_AUTO_INIT_ON_IMPORT", "0")
     monkeypatch.setenv("ALLOW_PASSWORD_DEVICE_AUTH_BATCH", "1")
 
     sys.modules.pop("db_models", None)
     import db_models
+    db_models.init_db_schema(run_migrations=True)
 
     # create one account without device auth
     db = db_models.SessionLocal()
@@ -68,4 +72,3 @@ def test_device_auth_jobs_writes_device_auth(tmp_path, monkeypatch):
         assert a2.device_secret == "S"
     finally:
         db.close()
-

@@ -18,6 +18,7 @@ def load_main_module(db_path: Path):
     os.environ["TELEGRAM_BOT_TOKEN"] = "123456:TEST_TOKEN"
     os.environ["ADMIN_TELEGRAM_ID"] = "1"
     os.environ["DB_URL"] = f"sqlite:///{db_path}"
+    os.environ["DB_AUTO_INIT_ON_IMPORT"] = "0"
     os.environ["MAX_TASKS_PER_TICK"] = "50"
     os.environ["PROCESS_TICK_SECONDS"] = "1"
     os.environ["DEFAULT_SEND_JITTER_MIN_SEC"] = "0"
@@ -38,6 +39,7 @@ def load_main_module(db_path: Path):
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     spec.loader.exec_module(module)
+    module.init_db_schema(run_migrations=True)
     return module
 
 

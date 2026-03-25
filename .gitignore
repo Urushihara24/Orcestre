@@ -26,6 +26,7 @@ secrets/
 *.zip
 backups/
 **/backups/
+migration_backup_*/
 dump/
 dumps/
 exports/

@@ -49,6 +49,7 @@ from db_models import (
     Account,
     Campaign,
     DB_URL,
+    init_db_schema,
     LogEvent,
     NicknameChangeTask,
     Proxy,
@@ -912,7 +913,7 @@ def target_required_senders(db, tgt: Target) -> int:
 
 
 def jitter_seconds_with_db(db) -> int:
-    """Джиттер, который использует уже открытую сессию (без db_exec)."""
+    """Джиттер из settings для текущей DB-сессии (test/helper compatibility)."""
     min_s = int(get_setting(db, "jitter_min_sec", str(DEFAULT_SEND_JITTER_MIN_SEC)))
     max_s = int(get_setting(db, "jitter_max_sec", str(DEFAULT_SEND_JITTER_MAX_SEC)))
     if max_s < min_s:
@@ -1361,33 +1362,6 @@ def reset_daily_counters_job():
     updated = db_exec(_inner)
     if updated:
         log_event("info", f"🔄 Сброшены суточные лимиты: {updated} аккаунтов")
-
-
-def pick_best_account(db) -> Optional[Account]:
-    """Выбрать лучший аккаунт"""
-    now = utc_now()
-    accs = db.query(Account).filter(
-        Account.enabled == True,
-        Account.status == AccountStatus.ACTIVE.value,
-        Account.epic_account_id.isnot(None),
-        Account.device_id.isnot(None),
-        Account.device_secret.isnot(None),
-        Account.today_sent < Account.daily_limit,
-    ).all()
-    valid = []
-    for a in accs:
-        if a.today_sent >= a.daily_limit:
-            continue
-        if a.warmup_until and now < a.warmup_until:
-            continue
-        windows = json.loads(a.active_windows_json or "[]")
-        if not is_in_window_for_account(db, windows, now):
-            continue
-        valid.append(a)
-    if not valid:
-        return None
-    valid.sort(key=lambda a: (a.today_sent, -a.total_sent))
-    return valid[0]
 
 
 def _done_sender_ids_for_target(
@@ -3147,6 +3121,19 @@ def show_target_senders_page(chat_id: int, target_id: int, page: int = 1):
             .scalar()
             or 0
         )
+        today_start, today_end = local_day_bounds_utc_naive(db, utc_now())
+        total_today = int(
+            db.query(func.count(func.distinct(Task.account_id)))
+            .filter(
+                Task.target_id == tgt.id,
+                Task.task_type == "send_request",
+                Task.status == TaskStatus.DONE.value,
+                Task.completed_at >= today_start,
+                Task.completed_at < today_end,
+            )
+            .scalar()
+            or 0
+        )
 
         pages = max(1, math.ceil(total / page_size)) if total else 1
         page_clamped = max(1, min(int(page), pages))
@@ -3221,6 +3208,7 @@ def show_target_senders_page(chat_id: int, target_id: int, page: int = 1):
             "tgt": tgt,
             "required": required,
             "total": total,
+            "total_today": total_today,
             "page": page_clamped,
             "pages": pages,
             "items": items,
@@ -3234,13 +3222,14 @@ def show_target_senders_page(chat_id: int, target_id: int, page: int = 1):
     tgt = data["tgt"]
     required = int(data["required"])
     total = int(data["total"])
+    total_today = int(data.get("total_today", 0))
     page_clamped = int(data["page"])
     pages = int(data["pages"])
     items = data["items"]
 
     lines = [
         f"Цель #{tgt.id} {tgt.username}",
-        f"Отправители ({total}/{required})",
+        f"Отправители (сегодня/план): {total_today}/{required} | Уникально всего: {total}",
         f"Страница: {page_clamped}/{pages} (по {page_size})",
         "Листай: ◀️ Страница / ▶️ Страница",
         "",
@@ -3468,16 +3457,6 @@ def cleanup_step(message):
 # ----------------------------
 # Keyboards
 # ----------------------------
-def kb_senders_pager(target_id: int, page: int, pages: int) -> types.InlineKeyboardMarkup:
-    m = types.InlineKeyboardMarkup(row_width=2)
-    prev_p = max(1, page - 1)
-    next_p = min(pages, page + 1)
-    m.add(
-        types.InlineKeyboardButton("⬅️", callback_data=f'tgt_senders:{target_id}:{prev_p}'),
-        types.InlineKeyboardButton("➡️", callback_data=f'tgt_senders:{target_id}:{next_p}'),
-    )
-    return m
-
 INLINE_ACTION_TEXT = {
     "main_accounts": "👥 Аккаунты",
     "main_targets": "🎯 Цели",
@@ -7553,52 +7532,21 @@ def cb_tgt_distribute(call):
 @admin_only_call
 def cb_set_limit(call):
     _safe_answer_callback(call)
-
-    def _inner(db):
-        vals = [int(v[0] or 0) for v in db.query(Account.daily_limit).all()]
-        if not vals:
-            return 0, 0, 0
-        return len(vals), min(vals), max(vals)
-
-    total, min_limit, max_limit = db_exec(_inner)
-    current = f"{min_limit}" if min_limit == max_limit else f"{min_limit}..{max_limit}"
-    dummy = py_types.SimpleNamespace(chat=call.message.chat, from_user=call.from_user)
-    ask_step(
-        dummy,
-        f"Текущий суточный лимит аккаунтов: {current}\n"
-        f"Аккаунтов в базе: {total}\n\n"
-        "Введи новый лимит (число >= 0):",
-        handle_set_limit,
+    show_menu_status(
+        call.message.chat.id,
+        "settings",
+        "ℹ️ Этот старый параметр отключён.\n"
+        "Лимиты задаются в «🛡️ API лимиты» и в параметрах цели.",
     )
 
 
 def handle_set_limit(message):
     cleanup_step(message)
-
-    try:
-        limit = int((message.text or "").strip())
-        if limit < 0:
-            raise ValueError()
-    except Exception:
-        show_menu_status(message.chat.id, "settings", "❌ Неверное число.")
-        return
-
-    def _inner(db):
-        prev_vals = [int(v[0] or 0) for v in db.query(Account.daily_limit).all()]
-        for a in db.query(Account).all():
-            a.daily_limit = limit
-        db.commit()
-        count = db.query(Account).count()
-        if not prev_vals:
-            return count, 0, 0
-        return count, min(prev_vals), max(prev_vals)
-
-    count, prev_min, prev_max = db_exec(_inner)
-    prev_txt = f"{prev_min}" if prev_min == prev_max else f"{prev_min}..{prev_max}"
     show_menu_status(
         message.chat.id,
         "settings",
-        f"✅ Суточный лимит аккаунтов обновлён:\nБыло: {prev_txt}\nСтало: {limit}\nПрименено к аккаунтам: {count}",
+        "ℹ️ Этот старый параметр отключён.\n"
+        "Используй «🛡️ API лимиты» и настройки выбранной цели.",
     )
 
 
@@ -7606,44 +7554,21 @@ def handle_set_limit(message):
 @admin_only_call
 def cb_set_jitter(call):
     _safe_answer_callback(call)
-
-    cur = db_exec(
-        lambda db: (
-            get_setting_int(db, "jitter_min_sec", DEFAULT_SEND_JITTER_MIN_SEC),
-            get_setting_int(db, "jitter_max_sec", DEFAULT_SEND_JITTER_MAX_SEC),
-        )
-    )
-    dummy = py_types.SimpleNamespace(chat=call.message.chat, from_user=call.from_user)
-    ask_step(
-        dummy,
-        f"Текущий глобальный джиттер: {cur[0]}-{cur[1]} сек\n\n"
-        "Введи: мин макс (в сек)\nПример: 300 900",
-        handle_set_jitter,
+    show_menu_status(
+        call.message.chat.id,
+        "settings",
+        "ℹ️ Глобальный джиттер отключён.\n"
+        "Настраивай джиттер в «🎯 Цели -> ✏️ Редактировать цель -> ⏱️ Джиттер».",
     )
 
 
 def handle_set_jitter(message):
     cleanup_step(message)
-
-    try:
-        min_s, max_s = map(int, (message.text or "").strip().split())
-        if min_s < 0 or max_s < min_s:
-            raise ValueError()
-    except Exception:
-        show_menu_status(message.chat.id, "settings", "❌ Неверный формат.")
-        return
-
-    prev = db_exec(
-        lambda db: (
-            get_setting_int(db, "jitter_min_sec", DEFAULT_SEND_JITTER_MIN_SEC),
-            get_setting_int(db, "jitter_max_sec", DEFAULT_SEND_JITTER_MAX_SEC),
-        )
-    )
-    db_exec(lambda db: (set_setting(db, "jitter_min_sec", str(min_s)), set_setting(db, "jitter_max_sec", str(max_s))))
     show_menu_status(
         message.chat.id,
         "settings",
-        f"✅ Глобальный джиттер обновлён:\nБыло: {prev[0]}-{prev[1]} сек\nСтало: {min_s}-{max_s} сек",
+        "ℹ️ Глобальный джиттер отключён.\n"
+        "Настраивай джиттер в параметрах выбранной цели.",
     )
 
 
@@ -7651,41 +7576,22 @@ def handle_set_jitter(message):
 @admin_only_call
 def cb_set_windows(call):
     _safe_answer_callback(call)
-
-    dummy = py_types.SimpleNamespace(chat=call.message.chat, from_user=call.from_user)
-    ask_step(
-        dummy,
-        "Формат:\nID_аккаунта\ndays=1,2,3 from=09:00 to=23:00\nПример:\n5\ndays=1,2,3,4,5 from=10:00 to=22:00\n"
-        "Важно: окно интерпретируется по МСК (Europe/Moscow).",
-        handle_set_windows,
+    show_menu_status(
+        call.message.chat.id,
+        "settings",
+        "ℹ️ Глобальные окна отключены.\n"
+        "Используй окна в настройках выбранной цели.",
     )
 
 
 def handle_set_windows(message):
     cleanup_step(message)
-
-    lines = safe_split_lines(message.text)
-    if len(lines) < 2:
-        show_menu_status(message.chat.id, "settings", "❌ Нужно минимум 2 строки.")
-        return
-
-    try:
-        acc_id = int(lines[0])
-        windows = parse_windows_text("\n".join(lines[1:]))
-    except Exception as e:
-        show_menu_status(message.chat.id, "settings", f"❌ Ошибка: {e}")
-        return
-
-    def _inner(db):
-        acc = db.query(Account).filter(Account.id == acc_id).first()
-        if not acc:
-            return False
-        acc.active_windows_json = json.dumps(windows)
-        db.commit()
-        return True
-
-    ok = db_exec(_inner)
-    show_menu_status(message.chat.id, "settings", "✅ Окна сохранены." if ok else "❌ Аккаунт не найден.")
+    show_menu_status(
+        message.chat.id,
+        "settings",
+        "ℹ️ Глобальные окна отключены.\n"
+        "Используй окна в параметрах выбранной цели.",
+    )
 
 
 @bot.callback_query_handler(func=lambda call: call.data == "set_target_senders")
@@ -7756,26 +7662,20 @@ def handle_set_target_senders(message):
 @admin_only_call
 def cb_set_timezone(call):
     _safe_answer_callback(call)
-
-    dummy = py_types.SimpleNamespace(chat=call.message.chat, from_user=call.from_user)
-    ask_step(
-        dummy,
-        "Введи timezone (пример: Europe/Moscow):",
-        handle_set_timezone,
+    show_menu_status(
+        call.message.chat.id,
+        "settings",
+        "ℹ️ Ручная смена TZ отключена: бот работает в фиксированном режиме Europe/Moscow.",
     )
 
 
 def handle_set_timezone(message):
     cleanup_step(message)
-    tz_name = (message.text or "").strip()
-    try:
-        ZoneInfo(tz_name)
-    except Exception:
-        show_menu_status(message.chat.id, "settings", "❌ Неверный часовой пояс (пример: Europe/Moscow)")
-        return
-
-    db_exec(lambda db: set_setting(db, "runtime_timezone", tz_name))
-    show_menu_status(message.chat.id, "settings", f"✅ Часовой пояс: {tz_name}")
+    show_menu_status(
+        message.chat.id,
+        "settings",
+        "ℹ️ Ручная смена TZ отключена: используется Europe/Moscow.",
+    )
 
 
 def handle_set_api_limits(message):
@@ -8528,6 +8428,8 @@ def _polling_with_retry():
 
 
 def run_app():
+    # Explicit DB bootstrap at startup (schema + lightweight migrations).
+    init_db_schema(run_migrations=True)
     ensure_runtime_settings()
     mode = os.getenv("APP_MODE", "all").strip().lower()
     if mode == "bot":

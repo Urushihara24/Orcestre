@@ -33,6 +33,7 @@ def fresh_main(tmp_path, monkeypatch):
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123456:TEST_TOKEN")
     monkeypatch.setenv("ADMIN_TELEGRAM_ID", "1")
     monkeypatch.setenv("DB_URL", f"sqlite:///{db_path}")
+    monkeypatch.setenv("DB_AUTO_INIT_ON_IMPORT", "0")
     monkeypatch.setenv("MAX_TASKS_PER_TICK", "50")
     monkeypatch.setenv("PROCESS_TICK_SECONDS", "1")
     monkeypatch.setenv("DEFAULT_SEND_JITTER_MIN_SEC", "0")
@@ -45,5 +46,5 @@ def fresh_main(tmp_path, monkeypatch):
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     spec.loader.exec_module(module)
+    module.init_db_schema(run_migrations=True)
     return module
-
