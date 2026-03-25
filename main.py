@@ -1396,40 +1396,18 @@ def _done_sender_ids_for_target(
     now: datetime,
     force_daily_repeat: bool = False,
 ) -> set[int]:
-    """
-    Covered senders for target.
-    Includes:
-    - successful send_request (DONE),
-    - precheck/idempotent skips that mean pair is already connected/pending,
-    - successful check_status accepted/pending confirmations.
-    """
+    """Covered senders for target by actual successful sends only (DONE send_request)."""
     send_done_q = db.query(Task.account_id).filter(
         Task.target_id == int(target_id),
         Task.task_type == "send_request",
         Task.status == TaskStatus.DONE.value,
     )
-    send_connected_q = db.query(Task.account_id).filter(
-        Task.target_id == int(target_id),
-        Task.task_type == "send_request",
-        Task.last_error.in_(PRECHECK_SKIP_REASONS),
-    )
-    check_connected_q = db.query(Task.account_id).filter(
-        Task.target_id == int(target_id),
-        Task.task_type == "check_status",
-        Task.status == TaskStatus.DONE.value,
-        Task.last_error.in_(["friend_status:accepted", "friend_status:pending"]),
-    )
 
     if (camp is not None and bool(camp.daily_repeat_enabled)) or bool(force_daily_repeat):
         day_start_utc, day_end_utc = local_day_bounds_utc_naive(db, now)
         send_done_q = send_done_q.filter(Task.completed_at >= day_start_utc, Task.completed_at < day_end_utc)
-        send_connected_q = send_connected_q.filter(Task.completed_at >= day_start_utc, Task.completed_at < day_end_utc)
-        check_connected_q = check_connected_q.filter(Task.completed_at >= day_start_utc, Task.completed_at < day_end_utc)
 
-    covered = {int(x[0]) for x in send_done_q.distinct().all()}
-    covered |= {int(x[0]) for x in send_connected_q.distinct().all()}
-    covered |= {int(x[0]) for x in check_connected_q.distinct().all()}
-    return covered
+    return {int(x[0]) for x in send_done_q.distinct().all()}
 
 
 def _precheck_skipped_sender_ids_for_target(db, target_id: int, camp: Optional[Campaign], now: datetime) -> set[int]:
