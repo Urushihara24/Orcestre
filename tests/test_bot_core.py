@@ -244,6 +244,111 @@ class TestBotCore(unittest.TestCase):
         finally:
             db.close()
 
+    def test_process_tasks_job_reassign_skips_already_used_sender(self):
+        m = self.main
+        acc_limited = self._create_account(login="lim2@example.com", daily_limit=1, today_sent=1)
+        acc_used = self._create_account(login="used@example.com", daily_limit=5, today_sent=0)
+        tgt_id = self._create_target(
+            status=m.TargetStatus.PENDING.value,
+            username="u_reassign_guard",
+            required_senders=2,
+        )
+
+        db = m.SessionLocal()
+        try:
+            # Sender acc_used already covered this target with real DONE send_request.
+            db.add(
+                m.Task(
+                    task_type="send_request",
+                    status=m.TaskStatus.DONE.value,
+                    account_id=acc_used,
+                    target_id=tgt_id,
+                    scheduled_for=m.utc_now() - timedelta(minutes=10),
+                    completed_at=m.utc_now() - timedelta(minutes=9),
+                    max_attempts=3,
+                )
+            )
+            db.add(
+                m.Task(
+                    task_type="send_request",
+                    status=m.TaskStatus.QUEUED.value,
+                    account_id=acc_limited,
+                    target_id=tgt_id,
+                    scheduled_for=m.utc_now() - timedelta(seconds=1),
+                    max_attempts=3,
+                )
+            )
+            db.commit()
+        finally:
+            db.close()
+
+        m.process_tasks_job()
+
+        db = m.SessionLocal()
+        try:
+            queued = (
+                db.query(m.Task)
+                .filter(
+                    m.Task.task_type == "send_request",
+                    m.Task.account_id == acc_limited,
+                    m.Task.target_id == tgt_id,
+                    m.Task.status == m.TaskStatus.POSTPONED.value,
+                )
+                .order_by(m.Task.id.desc())
+                .first()
+            )
+            self.assertIsNotNone(queued)
+            self.assertEqual(queued.last_error, "sender_daily_limit_no_replacement")
+
+            done_for_used = (
+                db.query(m.Task)
+                .filter(
+                    m.Task.task_type == "send_request",
+                    m.Task.account_id == acc_used,
+                    m.Task.target_id == tgt_id,
+                    m.Task.status == m.TaskStatus.DONE.value,
+                )
+                .count()
+            )
+            self.assertEqual(done_for_used, 1)
+        finally:
+            db.close()
+
+    def test_process_tasks_job_recovers_stale_running_send_task(self):
+        m = self.main
+        acc_id = self._create_account(login="stale@example.com", daily_limit=5, today_sent=0)
+        tgt_id = self._create_target(status=m.TargetStatus.PENDING.value, username="u_stale")
+
+        db = m.SessionLocal()
+        try:
+            stale = m.Task(
+                task_type="send_request",
+                status=m.TaskStatus.RUNNING.value,
+                account_id=acc_id,
+                target_id=tgt_id,
+                scheduled_for=m.utc_now() - timedelta(minutes=30),
+                started_at=m.utc_now() - timedelta(minutes=30),
+                attempt_number=0,
+                max_attempts=3,
+            )
+            db.add(stale)
+            db.commit()
+            stale_id = int(stale.id)
+        finally:
+            db.close()
+
+        m.process_tasks_job()
+
+        db = m.SessionLocal()
+        try:
+            stale = db.query(m.Task).filter(m.Task.id == stale_id).first()
+            self.assertEqual(stale.status, m.TaskStatus.POSTPONED.value)
+            self.assertEqual(stale.last_error, "running_timeout_recovered")
+            self.assertEqual(int(stale.attempt_number or 0), 1)
+            self.assertIsNone(stale.started_at)
+        finally:
+            db.close()
+
     def test_process_tasks_job_marks_manual_on_password_grant_blocked(self):
         m = self.main
 

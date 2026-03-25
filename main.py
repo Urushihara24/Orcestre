@@ -110,6 +110,7 @@ DEFAULT_SEND_API_COST = int(os.getenv("DEFAULT_SEND_API_COST", "3"))
 DEFAULT_CHECK_API_COST = int(os.getenv("DEFAULT_CHECK_API_COST", "2"))
 DEFAULT_RECHECK_DAILY_LIMIT = int(os.getenv("DEFAULT_RECHECK_DAILY_LIMIT", "500"))
 DEFAULT_DAILY_REPEAT_CAMPAIGN_ENABLED = os.getenv("DAILY_REPEAT_CAMPAIGN_ENABLED", "0").strip().lower() in {"1", "true", "yes"}
+RUNNING_TASK_STALE_SEC = max(60, int(os.getenv("RUNNING_TASK_STALE_SEC", "900")))
 
 DRY_RUN = os.getenv("DRY_RUN", "0").strip().lower() in {"1", "true", "yes"}
 DRY_RUN_ACCEPT_RATE = float(os.getenv("DRY_RUN_ACCEPT_RATE", "0.3"))
@@ -1987,11 +1988,60 @@ def campaign_sent_today_for_account(db, account_id: int, campaign_id: int, now_u
     )
 
 
+def _recover_stale_running_tasks(
+    db,
+    now: datetime,
+    campaign_id: Optional[int] = None,
+    stale_sec: Optional[int] = None,
+) -> int:
+    """
+    Recover tasks stuck in RUNNING state (e.g. worker/network crash).
+    Old RUNNING tasks are moved back to POSTPONED (or FAILED on max attempts)
+    so queue progress can continue.
+    """
+    timeout_sec = max(60, int(stale_sec or RUNNING_TASK_STALE_SEC))
+    stale_before = now - timedelta(seconds=int(timeout_sec))
+    q = db.query(Task).filter(
+        Task.status == TaskStatus.RUNNING.value,
+        Task.task_type.in_(["send_request", "check_status"]),
+        or_(
+            Task.started_at <= stale_before,
+            and_(Task.started_at.is_(None), Task.created_at <= stale_before),
+        ),
+    )
+    if campaign_id is not None:
+        q = q.filter(task_campaign_filter(db, int(campaign_id)))
+    if DB_URL.startswith("postgresql"):
+        q = q.with_for_update(skip_locked=True)
+    rows = q.all()
+
+    recovered = 0
+    for task in rows:
+        task.attempt_number = int(task.attempt_number or 0) + 1
+        max_attempts = max(1, int(task.max_attempts or 1))
+        if int(task.attempt_number) < int(max_attempts):
+            task.status = TaskStatus.POSTPONED.value
+            task.last_error = "running_timeout_recovered"
+            task.started_at = None
+            backoff_sec = random.randint(max(30, PROCESS_TICK_SECONDS), max(120, PROCESS_TICK_SECONDS * 6))
+            task.scheduled_for = now + timedelta(seconds=int(backoff_sec))
+        else:
+            task.status = TaskStatus.FAILED.value
+            task.last_error = "running_timeout_max_attempts"
+            task.completed_at = now
+        recovered += 1
+    return int(recovered)
+
+
 def rebuild_campaign_send_queue(db, campaign_id: int, create_limit: int = 5000) -> tuple[int, int]:
     """
     Remove stale queued/postponed send tasks for a goal and rebuild missing tasks
     under current goal settings.
     """
+    # First recover stale RUNNING tasks in this campaign so rebuild doesn't keep
+    # dead pairs blocked forever.
+    _recover_stale_running_tasks(db, utc_now(), campaign_id=int(campaign_id))
+
     dropped_queue = int(
         db.query(Task)
         .filter(
@@ -2018,6 +2068,8 @@ def process_tasks_job():
             return 0
         processed = 0
         now = utc_now()
+        recovered_running = _recover_stale_running_tasks(db, now)
+        processed += int(recovered_running or 0)
         tasks_query = db.query(Task).filter(
             Task.status.in_(QUEUED_OR_POSTPONED_TASK_STATUSES),
             Task.scheduled_for <= now
@@ -2174,17 +2226,59 @@ def process_tasks_job():
                     # задачу другим аккаунтом (иначе "ранние" задачи на лимитных
                     # аккаунтах будут постоянно отъедать MAX_TASKS_PER_TICK и
                     # блокировать прогресс очереди).
-                    alt = pick_best_account(db)
-                    if not alt or alt.id == acc.id:
+                    if is_recheck_resend or is_manual_forced_cycle:
                         task.status = TaskStatus.POSTPONED.value
+                        task.last_error = "sender_daily_limit_reached"
+                        reset_at = next_daily_reset_utc(now)
+                        task.scheduled_for = reset_at + timedelta(seconds=random.randint(0, 180))
+                        continue
+
+                    alt = _pick_replacement_account_for_target(
+                        db,
+                        target_id=int(tgt.id),
+                        camp=camp,
+                        now=now,
+                        excluded_ids={int(acc.id)},
+                    )
+                    if not alt:
+                        task.status = TaskStatus.POSTPONED.value
+                        task.last_error = "sender_daily_limit_no_replacement"
                         # Нет доступных аккаунтов прямо сейчас: отложим до следующего сброса,
                         # чтобы не перетирать MAX_TASKS_PER_TICK на одних и тех же задачах.
                         reset_at = next_daily_reset_utc(now)
                         task.scheduled_for = reset_at + timedelta(seconds=random.randint(0, 300))
                         continue
 
-                    task.account_id = alt.id
+                    task.account_id = int(alt.id)
                     acc = alt
+
+                    # Re-validate target/account constraints after account switch.
+                    done_sender_ids = _done_sender_ids_for_target(db, int(tgt.id), camp, now)
+                    if len(done_sender_ids) >= int(req):
+                        task.status = TaskStatus.CANCELLED.value
+                        task.completed_at = now
+                        task.last_error = "target_sender_cap_reached_after_reassign"
+                        processed += 1
+                        continue
+                    if int(acc.id) in done_sender_ids:
+                        task.status = TaskStatus.CANCELLED.value
+                        task.completed_at = now
+                        task.last_error = "sender_already_used_for_target_after_reassign"
+                        processed += 1
+                        continue
+                    has_other_active_pair = db.query(Task.id).filter(
+                        Task.task_type == "send_request",
+                        Task.target_id == int(tgt.id),
+                        Task.account_id == int(acc.id),
+                        Task.status.in_(ACTIVE_SEND_TASK_STATUSES),
+                        Task.id != int(task.id),
+                    ).first()
+                    if has_other_active_pair:
+                        task.status = TaskStatus.CANCELLED.value
+                        task.completed_at = now
+                        task.last_error = "duplicate_active_pair_task_after_reassign"
+                        processed += 1
+                        continue
 
                 if not DRY_RUN:
                     send_api_cost = max(1, get_setting_int(db, "send_api_cost", DEFAULT_SEND_API_COST))
