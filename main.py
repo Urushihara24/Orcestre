@@ -1873,6 +1873,12 @@ def create_tasks_for_new_targets(db, limit: int = 500, campaign_id: Optional[int
                 # Sender-first mode: sender#1 -> all nicks, sender#2 -> all nicks.
                 used_sender_blocks = 0
                 sender_timeline_offset_sec = int(elapsed_now_sec)
+                # Ensure sender blocks never overlap, even if switch gap is clamped
+                # by user settings: one sender completes its nick block first.
+                sender_block_stride_sec = max(
+                    1,
+                    int(targets_in_cycle) * max(1, int(max_s)) + int(auto_switch_gap_sec),
+                )
                 for shift, acc in enumerate(ordered_accs):
                     if all(int(st["missing"]) <= 0 for st in target_states):
                         break
@@ -1888,7 +1894,7 @@ def create_tasks_for_new_targets(db, limit: int = 500, campaign_id: Optional[int
                     if sender_capacity <= 0:
                         continue
 
-                    desired_start_offset = max(0, elapsed_now_sec + int(used_sender_blocks * auto_switch_gap_sec))
+                    desired_start_offset = max(0, elapsed_now_sec + int(used_sender_blocks * sender_block_stride_sec))
                     # Enforce strict layer order: next sender starts only after
                     # previous sender block is fully scheduled.
                     block_start_offset = max(int(sender_timeline_offset_sec), int(desired_start_offset))
