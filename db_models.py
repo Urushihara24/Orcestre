@@ -1,5 +1,6 @@
 import os
 from datetime import datetime, timezone
+import threading
 
 from dotenv import load_dotenv
 from sqlalchemy import (
@@ -28,6 +29,8 @@ if DB_URL.startswith("sqlite"):
 engine = create_engine(DB_URL, **engine_kwargs)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 Base = declarative_base()
+_DB_INIT_LOCK = threading.Lock()
+_DB_INIT_DONE = False
 
 
 def utc_now_naive() -> datetime:
@@ -176,9 +179,6 @@ class Campaign(Base):
     updated_at = Column(DateTime, default=utc_now_naive)
 
 
-Base.metadata.create_all(bind=engine)
-
-
 def _ensure_column(table: str, column: str, ddl_suffix: str) -> None:
     cols = {c["name"] for c in inspect(engine).get_columns(table)}
     if column in cols:
@@ -227,4 +227,22 @@ def _run_lightweight_migrations() -> None:
     # Legacy rows with campaign_id NULL stay as-is for backward compatibility.
 
 
-_run_lightweight_migrations()
+def init_db_schema(run_migrations: bool = True) -> None:
+    """
+    Explicit DB schema bootstrap.
+    Call this from app entrypoints/tools instead of relying on import-time side effects.
+    """
+    global _DB_INIT_DONE
+    with _DB_INIT_LOCK:
+        if _DB_INIT_DONE:
+            return
+        Base.metadata.create_all(bind=engine)
+        if run_migrations:
+            _run_lightweight_migrations()
+        _DB_INIT_DONE = True
+
+
+# Backward-compatibility switch for old scripts/tests that still rely on import-time init.
+# New code should call init_db_schema() explicitly.
+if os.getenv("DB_AUTO_INIT_ON_IMPORT", "0").strip().lower() in {"1", "true", "yes"}:
+    init_db_schema(run_migrations=True)
