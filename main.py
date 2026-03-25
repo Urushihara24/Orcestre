@@ -34,6 +34,7 @@ from epic_api_client import (
     remove_friend_with_device,
     verify_account_health_with_device,
     change_display_name_with_device,
+    set_profile_privacy_with_device,
 )
 from epic_device_auth import EpicDeviceAuthGenerator, append_device_auth_to_file
 from campaign_settings import (
@@ -251,6 +252,15 @@ PRECHECK_SKIP_REASONS = (
     "idempotent_request_skip_requeued",
 )
 
+PROFILE_PRIVACY_LEVEL_PUBLIC = "PUBLIC"
+PROFILE_PRIVACY_LEVEL_FRIENDS_ONLY = "FRIENDS_ONLY"
+PROFILE_PRIVACY_LEVEL_PRIVATE = "PRIVATE"
+PROFILE_PRIVACY_LABEL_RU = {
+    PROFILE_PRIVACY_LEVEL_PUBLIC: "Открытый",
+    PROFILE_PRIVACY_LEVEL_FRIENDS_ONLY: "Только друзья",
+    PROFILE_PRIVACY_LEVEL_PRIVATE: "Закрытый",
+}
+
 
 def target_status_ru(code: str) -> str:
     return TARGET_STATUS_RU.get(code, code or "неизвестно")
@@ -435,6 +445,43 @@ def set_setting(db, key: str, value: str):
     db.commit()
 
 
+def _load_int_set_setting(db, key: str) -> set[int]:
+    raw = (get_setting(db, key, "") or "").strip()
+    if not raw:
+        return set()
+    out: set[int] = set()
+    # Preferred format: JSON array, with fallback to comma-separated legacy strings.
+    try:
+        data = json.loads(raw)
+        if isinstance(data, list):
+            for x in data:
+                try:
+                    v = int(x)
+                    if v > 0:
+                        out.add(v)
+                except Exception:
+                    continue
+            return out
+    except Exception:
+        pass
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            v = int(part)
+            if v > 0:
+                out.add(v)
+        except Exception:
+            continue
+    return out
+
+
+def _save_int_set_setting(db, key: str, values: set[int]):
+    payload = json.dumps(sorted(int(v) for v in values if int(v) > 0), ensure_ascii=False)
+    set_setting(db, key, payload)
+
+
 def ensure_runtime_settings() -> None:
     def _inner(db):
         defaults = {
@@ -456,6 +503,7 @@ def ensure_runtime_settings() -> None:
             "sender_switch_max_sec": "0",
             "new_send_requests_enabled": "1",
             "recheck_only_mode_enabled": "0",
+            "recheck_enabled": "1",
         }
         for key, val in defaults.items():
             if db.query(Setting).filter(Setting.key == key).first() is None:
@@ -538,6 +586,72 @@ def set_recheck_only_mode_enabled(db, enabled: bool):
     set_setting(db, "recheck_only_mode_enabled", "1" if enabled else "0")
 
 
+def is_recheck_enabled(db) -> bool:
+    return get_setting_bool(db, "recheck_enabled", True)
+
+
+def set_recheck_enabled(db, enabled: bool):
+    set_setting(db, "recheck_enabled", "1" if enabled else "0")
+
+
+SEND_MODE_NEW_ONLY = "new_only"
+SEND_MODE_NEW_AND_RECHECK = "new_and_recheck"
+SEND_MODE_RECHECK_ONLY = "recheck_only"
+
+
+def get_send_mode(db) -> str:
+    new_sends_enabled = is_new_send_requests_enabled(db)
+    recheck_enabled = is_recheck_enabled(db)
+    recheck_only = is_recheck_only_mode_enabled(db)
+
+    if recheck_only:
+        return SEND_MODE_RECHECK_ONLY
+    if new_sends_enabled and recheck_enabled:
+        return SEND_MODE_NEW_AND_RECHECK
+    if new_sends_enabled and not recheck_enabled:
+        return SEND_MODE_NEW_ONLY
+    if (not new_sends_enabled) and recheck_enabled:
+        return SEND_MODE_RECHECK_ONLY
+    # Legacy fallback (both disabled): treated as new_only for safe recovery in UI.
+    return SEND_MODE_NEW_ONLY
+
+
+def send_mode_label(mode: str) -> str:
+    if mode == SEND_MODE_NEW_ONLY:
+        return "Новые заявки"
+    if mode == SEND_MODE_NEW_AND_RECHECK:
+        return "Новые + recheck"
+    if mode == SEND_MODE_RECHECK_ONLY:
+        return "Только recheck"
+    return "Неизвестно"
+
+
+def set_send_mode(db, mode: str) -> tuple[bool, bool, bool]:
+    """
+    Apply one of 3 global send modes.
+    Returns (new_sends_enabled, recheck_enabled, recheck_only_enabled).
+    """
+    if mode == SEND_MODE_NEW_ONLY:
+        set_new_send_requests_enabled(db, True)
+        set_recheck_enabled(db, False)
+        set_recheck_only_mode_enabled(db, False)
+    elif mode == SEND_MODE_NEW_AND_RECHECK:
+        set_new_send_requests_enabled(db, True)
+        set_recheck_enabled(db, True)
+        set_recheck_only_mode_enabled(db, False)
+    elif mode == SEND_MODE_RECHECK_ONLY:
+        set_new_send_requests_enabled(db, False)
+        set_recheck_enabled(db, True)
+        set_recheck_only_mode_enabled(db, True)
+    else:
+        raise ValueError("unsupported send mode")
+    return (
+        bool(is_new_send_requests_enabled(db)),
+        bool(is_recheck_enabled(db)),
+        bool(is_recheck_only_mode_enabled(db)),
+    )
+
+
 def validate_requested_nickname(raw_value: str) -> tuple[bool, str]:
     nickname = str(raw_value or "").strip()
     if not nickname:
@@ -545,6 +659,22 @@ def validate_requested_nickname(raw_value: str) -> tuple[bool, str]:
     if not NICKNAME_ALLOWED_RE.fullmatch(nickname):
         return False, "формат: только латиница/цифры/_ и длина 3..16"
     return True, ""
+
+
+def parse_profile_privacy_level(raw_value: str) -> tuple[bool, str, str]:
+    """
+    Returns: (ok, level_code, error_message)
+    level_code in: PUBLIC / FRIENDS_ONLY / PRIVATE
+    """
+    raw = str(raw_value or "").strip()
+    norm = raw.lower()
+    if norm in {"1", "open", "public", "открытый", "открыт", "публичный", "паблик"}:
+        return True, PROFILE_PRIVACY_LEVEL_PUBLIC, ""
+    if norm in {"2", "closed", "private", "закрытый", "закрыт", "приватный", "приват"}:
+        return True, PROFILE_PRIVACY_LEVEL_PRIVATE, ""
+    if norm in {"3", "friends", "friends_only", "друзья", "только друзья"}:
+        return True, PROFILE_PRIVACY_LEVEL_FRIENDS_ONLY, ""
+    return False, "", "Введи 1/2/3 или open/closed/friends"
 
 
 def _nickname_fallback_candidates(nickname: str, limit: int = NICKNAME_FALLBACK_LIMIT) -> list[str]:
@@ -1919,13 +2049,16 @@ def create_tasks_for_new_targets(db, limit: int = 500, campaign_id: Optional[int
                 excluded_ids = set(int(x) for x in assigned_accounts) | set(int(x) for x in state["skipped"])
                 acc = pick_best_account_with_reservations_excluded(db, reserved_by_account, excluded_ids)
                 if not acc or int(acc.id) in assigned_accounts:
-                    log_event_in_db(
-                        db,
-                        "warning",
-                        f"⚠️ Не хватило уникальных аккаунтов для цели {t.username} "
-                        f"(цель #{(campaign_id_for_tasks if campaign_id_for_tasks is not None else 'current')}): "
-                        f"нужно {required}, назначено {len(assigned_accounts)}",
-                    )
+                    if _should_log_unique_shortage_warning(
+                        campaign_id_for_tasks, int(t.id), int(required), len(assigned_accounts)
+                    ):
+                        log_event_in_db(
+                            db,
+                            "warning",
+                            f"⚠️ Не хватило уникальных аккаунтов для цели {t.username} "
+                            f"(цель #{(campaign_id_for_tasks if campaign_id_for_tasks is not None else 'current')}): "
+                            f"нужно {required}, назначено {len(assigned_accounts)}",
+                        )
                     break
                 if _assign_task(acc, state):
                     created += 1
@@ -1933,13 +2066,16 @@ def create_tasks_for_new_targets(db, limit: int = 500, campaign_id: Optional[int
     for state in target_states:
         if int(state["missing"]) > 0:
             t = state["target"]
-            log_event_in_db(
-                db,
-                "warning",
-                f"⚠️ Не хватило уникальных аккаунтов для цели {t.username} "
-                f"(цель #{(campaign_id_for_tasks if campaign_id_for_tasks is not None else 'current')}): "
-                f"нужно {int(state['required'])}, назначено {len(state['assigned'])}",
-            )
+            if _should_log_unique_shortage_warning(
+                campaign_id_for_tasks, int(t.id), int(state["required"]), len(state["assigned"])
+            ):
+                log_event_in_db(
+                    db,
+                    "warning",
+                    f"⚠️ Не хватило уникальных аккаунтов для цели {t.username} "
+                    f"(цель #{(campaign_id_for_tasks if campaign_id_for_tasks is not None else 'current')}): "
+                    f"нужно {int(state['required'])}, назначено {len(state['assigned'])}",
+                )
     db.commit()
     log_event_in_db(db, "info", f"⚙️ create_tasks_for_new_targets: готово, создано {created}")
     return created
@@ -2550,8 +2686,10 @@ def process_tasks_job():
                         task.last_error = "friend_status:pending"
                     else:
                         # Friendship/request disappeared.
-                        # If it was previously accepted, schedule resend from the same sender.
-                        if int(tgt.accepted_count or 0) > 0:
+                        # Re-send only when THIS sender->target pair was accepted before.
+                        # Goal-level accepted_count is not enough and can cause false requeues.
+                        pair_was_accepted = _pair_was_accepted(db, int(tgt.id), int(acc.id))
+                        if pair_was_accepted:
                             has_active_send = db.query(Task.id).filter(
                                 Task.task_type == "send_request",
                                 Task.account_id == int(acc.id),
@@ -2890,6 +3028,8 @@ REL_ACTION_JOBS = {}
 REL_ACTION_JOBS_LOCK = threading.Lock()
 ALLOW_SHOW_PASSWORD = os.getenv("ALLOW_SHOW_PASSWORD", "0").strip().lower() in {"1", "true", "yes"}
 AUTH_OPERATOR_IDS_SETTING_KEY = "auth_operator_ids"
+UNIQUE_SHORTAGE_WARN_CACHE = {}
+UNIQUE_SHORTAGE_WARN_LOCK = threading.Lock()
 
 
 def _load_auth_operator_ids(db) -> set[int]:
@@ -3034,6 +3174,35 @@ def _safe_delete_user_message(message):
         bot.delete_message(message.chat.id, message.message_id)
     except Exception as e:
         logger.debug(f"delete_user_message failed chat_id={message.chat.id} msg_id={message.message_id}: {e}")
+
+
+def _should_log_unique_shortage_warning(
+    campaign_id: Optional[int],
+    target_id: int,
+    required: int,
+    assigned: int,
+    cooldown_sec: int = 900,
+) -> bool:
+    """
+    Throttle repeated "not enough unique accounts" warnings:
+    at most once per cooldown window for each campaign/target pair.
+    """
+    key = (int(campaign_id or 0), int(target_id))
+    now_ts = time.monotonic()
+    with UNIQUE_SHORTAGE_WARN_LOCK:
+        prev = UNIQUE_SHORTAGE_WARN_CACHE.get(key)
+        if prev and float(now_ts - float(prev.get("ts", 0.0))) < float(cooldown_sec):
+            # Suppress repeated warning bursts while shortage is ongoing.
+            prev["required"] = int(required)
+            prev["assigned"] = int(assigned)
+            UNIQUE_SHORTAGE_WARN_CACHE[key] = prev
+            return False
+        UNIQUE_SHORTAGE_WARN_CACHE[key] = {
+            "required": int(required),
+            "assigned": int(assigned),
+            "ts": float(now_ts),
+        }
+        return True
 
 
 def _track_transient(chat_id: int, message_id: int):
@@ -3471,6 +3640,7 @@ INLINE_ACTION_TEXT = {
     "acc_device": "🔐 Авторизация Epic (ссылка)",
     "acc_check": "✅ Проверить аккаунты",
     "acc_refresh_names": "🔄 Обновить ники Epic",
+    "acc_privacy_bulk": "🔒 Конфиденциальность профиля",
     "acc_nick_change_import": "📝 Массовая смена ников",
     "acc_nick_change_status": "📊 Статус смены ников",
     "acc_add": "➕ Добавить аккаунт",
@@ -3521,6 +3691,7 @@ INLINE_ACTION_TEXT = {
     "set_api_limits": "🛡️ API лимиты",
     "set_proxy": "📌 Прокси",
     "set_auth_access": "👤 Доступ auth",
+    "set_send_mode": "🎛️ Режим отправки",
     "set_new_sends": "🧯 Новые заявки",
     "set_recheck_only": "♻️ Только recheck",
     "auth_add": "➕ Добавить ID auth",
@@ -3577,12 +3748,57 @@ def kb_accounts_reply() -> types.InlineKeyboardMarkup:
     m = types.InlineKeyboardMarkup(row_width=2)
     m.add(_act_btn("acc_import"), _act_btn("acc_list"))
     m.add(_act_btn("acc_device"), _act_btn("acc_check"))
-    m.add(_act_btn("acc_refresh_names"))
+    m.add(_act_btn("acc_refresh_names"), _act_btn("acc_privacy_bulk"))
     m.add(_act_btn("acc_nick_change_import"), _act_btn("acc_nick_change_status"))
     m.add(_act_btn("acc_add"), _act_btn("acc_del"))
     m.add(_act_btn("acc_prev"), _act_btn("acc_next"))
     m.add(_act_btn("acc_search"))
     m.add(_act_btn("back"))
+    return m
+
+
+def kb_accounts_list_reply(accounts: list[Account]) -> types.InlineKeyboardMarkup:
+    """
+    Специализированная клавиатура списка аккаунтов:
+    - быстрый клик по аккаунту для смены приватности
+    - пагинация/поиск
+    - возврат в меню аккаунтов
+    """
+    m = types.InlineKeyboardMarkup(row_width=2)
+    for acc in accounts:
+        sender_label = str(getattr(acc, "epic_display_name", "") or "").strip() or str(acc.login or "")
+        short = sender_label if len(sender_label) <= 26 else sender_label[:25] + "…"
+        m.add(
+            types.InlineKeyboardButton(
+                f"🔒 {short}",
+                callback_data=f"acc_pick_priv:{int(acc.id)}",
+            )
+        )
+    m.add(_act_btn("acc_prev"), _act_btn("acc_next"))
+    m.add(_act_btn("acc_search"), _act_btn("acc_privacy_bulk"))
+    m.add(_act_btn("back"))
+    return m
+
+
+def kb_account_privacy_one_reply(account_id: int) -> types.InlineKeyboardMarkup:
+    m = types.InlineKeyboardMarkup(row_width=2)
+    m.add(
+        types.InlineKeyboardButton(
+            "🌐 Открытый",
+            callback_data=f"acc_set_priv:{int(account_id)}:{PROFILE_PRIVACY_LEVEL_PUBLIC}",
+        ),
+        types.InlineKeyboardButton(
+            "🔒 Закрытый",
+            callback_data=f"acc_set_priv:{int(account_id)}:{PROFILE_PRIVACY_LEVEL_PRIVATE}",
+        ),
+    )
+    m.add(
+        types.InlineKeyboardButton(
+            "👥 Только друзья",
+            callback_data=f"acc_set_priv:{int(account_id)}:{PROFILE_PRIVACY_LEVEL_FRIENDS_ONLY}",
+        )
+    )
+    m.add(types.InlineKeyboardButton("⬅️ К списку аккаунтов", callback_data="acc_list"))
     return m
 
 
@@ -3654,7 +3870,7 @@ def kb_goal_edit_reply() -> types.InlineKeyboardMarkup:
 def kb_settings_reply() -> types.InlineKeyboardMarkup:
     m = types.InlineKeyboardMarkup(row_width=2)
     m.add(_act_btn("set_api_limits"), _act_btn("set_proxy"))
-    m.add(_act_btn("set_new_sends"), _act_btn("set_recheck_only"))
+    m.add(_act_btn("set_send_mode"))
     m.add(_act_btn("set_auth_access"))
     m.add(_act_btn("back"))
     return m
@@ -3757,7 +3973,7 @@ def show_accounts_menu(chat_id: int):
     set_chat_ui_value(chat_id, "acc_query", "")
     show_screen(
         chat_id,
-        "👥 Управление аккаунтами\nИмпорт, авторизация Epic, список, проверка.",
+        "👥 Управление аккаунтами\nИмпорт, авторизация Epic, список, проверка, приватность профиля.",
         reply_markup=kb_accounts_reply(),
         parse_mode=None,
         force_new=True,
@@ -3899,26 +4115,69 @@ def show_goal_edit_menu(chat_id: int):
     )
 
 
+def _settings_snapshot_text() -> str:
+    def _inner(db):
+        min_interval = get_setting_int(db, "min_request_interval_sec", DEFAULT_MIN_REQUEST_INTERVAL_SEC)
+        hourly_limit = get_setting_int(db, "hourly_api_limit", DEFAULT_HOURLY_API_LIMIT)
+        daily_limit = get_setting_int(db, "daily_api_limit", DEFAULT_DAILY_API_LIMIT)
+        sends_enabled = is_new_send_requests_enabled(db)
+        recheck_enabled = is_recheck_enabled(db)
+        recheck_only = is_recheck_only_mode_enabled(db)
+        mode = get_send_mode(db)
+        proxy_total = int(db.query(Proxy.id).count())
+        proxy_enabled = int(db.query(Proxy).filter(Proxy.enabled == True).count())
+        auth_ids_count = len(_load_auth_operator_ids(db))
+        return (
+            int(min_interval),
+            int(hourly_limit),
+            int(daily_limit),
+            bool(sends_enabled),
+            bool(recheck_enabled),
+            bool(recheck_only),
+            str(mode),
+            int(proxy_enabled),
+            int(proxy_total),
+            int(auth_ids_count),
+        )
+
+    (
+        min_interval,
+        hourly_limit,
+        daily_limit,
+        sends_enabled,
+        recheck_enabled,
+        recheck_only,
+        mode,
+        proxy_enabled,
+        proxy_total,
+        auth_ids_count,
+    ) = db_exec(_inner)
+    env_gate = "включен" if SEND_REQUESTS_ENABLED else "выключен"
+    lines = [
+        "Текущие общие настройки:",
+        f"• API: интервал {min_interval}с, в час {hourly_limit}, в сутки {daily_limit}",
+        f"• Режим отправки: {send_mode_label(mode)}",
+        f"• Новые заявки: {'включены' if sends_enabled else 'выключены'}",
+        f"• Recheck: {'включен' if recheck_enabled else 'выключен'}",
+        f"• Только recheck: {'включен' if recheck_only else 'выключен'}",
+        f"• Прокси: {proxy_enabled}/{proxy_total} активных",
+        f"• Доступ auth: {auth_ids_count} ID",
+        f"• ENV send gate: {env_gate}",
+    ]
+    if not SEND_REQUESTS_ENABLED:
+        lines.append("⚠️ ENV-предохранитель отключает реальные отправки.")
+    return "\n".join(lines)
+
+
 def show_settings_menu(chat_id: int):
     cancel_all_step_prompts(chat_id)
     set_current_menu(chat_id, "settings")
-    sends_enabled, recheck_only = db_exec(
-        lambda db: (
-            is_new_send_requests_enabled(db),
-            is_recheck_only_mode_enabled(db),
-        )
-    )
-    env_gate = "включен" if SEND_REQUESTS_ENABLED else "выключен"
-    env_hint = ""
-    if not SEND_REQUESTS_ENABLED:
-        env_hint = "\n⚠️ ENV-предохранитель отключает реальные отправки."
+    snapshot = _settings_snapshot_text()
     show_screen(
         chat_id,
         "⚙️ Настройки\n"
-        "Глобальные параметры: API лимиты, прокси, доступ auth.\n"
-        f"Новые заявки: {'включены' if sends_enabled else 'выключены'}\n"
-        f"Режим recheck-only: {'включен' if recheck_only else 'выключен'}\n"
-        f"ENV send gate: {env_gate}{env_hint}",
+        "Глобальные параметры: API лимиты, прокси, доступ auth.\n\n"
+        f"{snapshot}",
         reply_markup=kb_settings_reply(),
         parse_mode=None,
         force_new=True,
@@ -4103,7 +4362,11 @@ def show_menu_status(chat_id: int, menu_key: str, status_text: str):
     }
     title, kb_fn = menus[menu_key]
     set_current_menu(chat_id, menu_key)
-    body = f"{title}\n\n{status_text}" if status_text else title
+    if menu_key == "settings":
+        snapshot = _settings_snapshot_text()
+        body = f"{title}\n\n{status_text}\n\n{snapshot}" if status_text else f"{title}\n\n{snapshot}"
+    else:
+        body = f"{title}\n\n{status_text}" if status_text else title
     show_screen(chat_id, body, reply_markup=kb_fn(), parse_mode=None, force_new=True)
 
 
@@ -4255,7 +4518,52 @@ def show_accounts_list(chat_id: int, page: int = 1, query: str = ""):
     text = "\n".join(lines)
     if len(text) > 3800:
         text = text[:3790] + "…"
-    show_screen(chat_id, text, reply_markup=kb_accounts_reply(), parse_mode="Markdown", force_new=True)
+    show_screen(chat_id, text, reply_markup=kb_accounts_list_reply(accs), parse_mode="Markdown", force_new=True)
+
+
+def show_account_privacy_menu(chat_id: int, account_id: int, status_note: str = ""):
+    def _inner(db):
+        acc = db.query(Account).filter(Account.id == int(account_id)).first()
+        if not acc:
+            return None
+        sender_label = str(getattr(acc, "epic_display_name", "") or "").strip() or str(acc.login or "")
+        has_da = bool(acc.epic_account_id and acc.device_id and acc.device_secret)
+        return {
+            "id": int(acc.id),
+            "login": str(acc.login),
+            "label": sender_label,
+            "enabled": bool(acc.enabled),
+            "status": str(acc.status or ""),
+            "has_da": has_da,
+        }
+
+    row = db_exec(_inner)
+    if not row:
+        show_menu_status(chat_id, "accounts", f"❌ Аккаунт #{account_id} не найден.")
+        return
+
+    lines = [
+        "🔒 Конфиденциальность профиля",
+        f"Аккаунт: {md_inline_code(row['label'])}",
+        f"Логин: {md_inline_code(row['login'])}",
+        f"Статус: {'активен' if row['enabled'] and row['status'] == AccountStatus.ACTIVE.value else row['status']}",
+        f"Device auth: {'есть' if row['has_da'] else 'нет'}",
+        "",
+        "Выбери режим приватности:",
+        "• 🌐 Открытый",
+        "• 🔒 Закрытый",
+        "• 👥 Только друзья",
+    ]
+    if status_note:
+        lines.extend(["", status_note])
+
+    show_screen(
+        chat_id,
+        "\n".join(lines),
+        reply_markup=kb_account_privacy_one_reply(int(account_id)),
+        parse_mode="Markdown",
+        force_new=True,
+    )
 
 
 def show_targets_status(chat_id: int, page: int = 1, query: str = ""):
@@ -4580,6 +4888,7 @@ def show_campaign_progress(chat_id: int, with_campaign_info: bool = False):
     def _inner(db):
         camp = get_campaign_or_default(db, selected_campaign_id)
         now = utc_now()
+        today = utc_today().isoformat()
         day_start, day_end = local_day_bounds_utc_naive(db, utc_now())
         targets = (
             db.query(Target.id, Target.status, Target.required_senders)
@@ -4730,10 +5039,17 @@ def show_campaign_progress(chat_id: int, with_campaign_info: bool = False):
                 sent = campaign_sent_today_for_account(db, int(a.id), int(camp.id), now)
                 if sent >= eff_limit:
                     at_limit_count += 1
+            recheck_day_key = f"recheck_counter_day_{int(camp.id)}"
+            recheck_val_key = f"recheck_counter_value_{int(camp.id)}"
+            recheck_day = get_setting(db, recheck_day_key, "")
+            recheck_used_today = get_setting_int(db, recheck_val_key, 0) if recheck_day == today else 0
+            recheck_limit = max(0, int(camp.recheck_daily_limit or DEFAULT_RECHECK_DAILY_LIMIT))
         else:
             for a in ready_accounts:
                 if int(a.today_sent or 0) >= int(a.daily_limit or 0):
                     at_limit_count += 1
+            recheck_used_today = 0
+            recheck_limit = 0
         default_required = max(1, get_setting_int(db, "target_senders_count", DEFAULT_TARGET_SENDERS_COUNT))
         max_required_per_target = 0
         targets_with_sender_deficit = 0
@@ -4778,6 +5094,8 @@ def show_campaign_progress(chat_id: int, with_campaign_info: bool = False):
             int(max_done_per_target),
             int(pool_layers_left),
             int(targets_pool_exhausted),
+            int(recheck_used_today),
+            int(recheck_limit),
             default_required,
             camp_name,
             bool(repeat_daily),
@@ -4808,6 +5126,8 @@ def show_campaign_progress(chat_id: int, with_campaign_info: bool = False):
         max_done_per_target,
         pool_layers_left,
         targets_pool_exhausted,
+        recheck_used_today,
+        recheck_limit,
         default_required,
         camp_name,
         repeat_daily,
@@ -4847,6 +5167,7 @@ def show_campaign_progress(chat_id: int, with_campaign_info: bool = False):
 
     remaining = max(0, required_total - covered_total)
     sender_deficit_per_nick = max(0, int(max_required_per_target) - int(ready_count))
+    uncovered_targets = max(0, int(total_targets) - int(fully_covered))
     title = (
         f"📈 Прогресс цели №{campaign_num} {camp_name} (id:{campaign_id})"
         if campaign_id > 0
@@ -4854,40 +5175,39 @@ def show_campaign_progress(chat_id: int, with_campaign_info: bool = False):
     )
     lines = [
         title,
-        f"Целей: {total_targets}",
-        f"Полностью покрыты: {fully_covered}/{total_targets}",
-        f"Покрытие отправителей {'(сегодня)' if repeat_daily else '(всего)'}: {covered_total}/{required_total}",
-        f"Осталось отправок для покрытия: {remaining}",
+        "Период: текущие сутки (МСК).",
         "",
-        "На ники получателя:",
-        f"• Отправлено сегодня: {total_send_done_today}",
-        f"• Отправлено всего: {total_send_done}",
-        f"• Принято сегодня: {accepted_today}",
-        f"• Отклонено сегодня: {rejected_today}",
-        f"• Ожидают ответа (после отправки): {awaiting_response}",
+        "Покрытие цели:",
+        f"• Ников всего: {total_targets}",
+        f"• Полностью покрыто: {fully_covered}/{total_targets}",
+        f"• Ников с недопокрытием: {uncovered_targets}",
+        f"• Закрыто пар аккаунт→ник {'(сегодня)' if repeat_daily else '(всего)'}: {covered_total}/{required_total}",
+        f"• Осталось пар до полного покрытия: {remaining}",
+        "",
+        "Новые отправки:",
+        f"• Новых заявок отправлено сегодня (DONE send_request): {total_send_done_today}",
+        f"• Уникальных аккаунтов отправителей сегодня: {senders_today}",
+        f"• Новых заявок отправлено всего: {total_send_done}",
+        "",
+        "Очередь и проверка:",
         f"• Ожидают первичной отправки: {waiting_delivery}",
+        f"• Ожидают ответа после отправки: {awaiting_response}",
         f"• В очереди отправки: {send_queue}",
         f"• В очереди проверки: {check_queue}",
+        f"• Recheck сегодня: {recheck_used_today}/{recheck_limit} отправителей",
         "",
-        "С аккаунтов-отправителей:",
-        f"• Отправляли сегодня: {senders_today}",
-        f"• Отправляли всего: {senders_total}",
+        "Результаты сегодня:",
+        f"• Принято: {accepted_today}",
+        f"• Отклонено: {rejected_today}",
+        "",
+        "Отправители:",
         f"• Готовы к работе (active+device_auth): {ready_count}",
+        f"• Отправляли в этой цели (всего уникальных): {senders_total}",
         f"• Уже использовались в цели: {used_ready_count}",
         f"• Ещё не использовались в цели: {unused_ready_count}",
-        f"• Уперлись в дневной лимит: {at_limit_count}",
+        f"• Уперлись в дневной лимит API: {at_limit_count}",
         "",
-        "Ёмкость по цели:",
-        f"• Макс. нужно отправителей на ник: {max_required_per_target}",
-        f"• Ников с нехваткой отправителей: {targets_with_sender_deficit}",
-        f"• Дефицит отправителей на ник (макс): {sender_deficit_per_nick}",
-        "",
-        "Запас отправителей (по текущему прогрессу):",
-        f"• Самый покрытый ник: {max_done_per_target}/{ready_count} отправителей",
-        f"• Осталось до исчерпания пула: {pool_layers_left}",
-        f"• Ников уже уперлись в пул: {targets_pool_exhausted}",
-        "",
-        "Статусы целей:",
+        "Статусы ников:",
         f"🆕 новая={int(status_counts.get(TargetStatus.NEW.value, 0) or 0)}",
         f"⏳ в ожидании={int(status_counts.get(TargetStatus.PENDING.value, 0) or 0)}",
         f"📨 отправлено={int(status_counts.get(TargetStatus.SENT.value, 0) or 0)}",
@@ -5205,13 +5525,17 @@ def _handle_targets_goals_actions(message, text: str, chat_id: int) -> bool:
         return True
     if text == "🔁 Дослать отсутствующих":
         queued, skipped_connected, skipped_other = enqueue_goal_resend_missing(chat_id)
+        total_pairs = int(queued) + int(skipped_connected) + int(skipped_other)
+        need_resend_now = max(0, int(queued) + int(skipped_other))
         show_menu_status(
             chat_id,
             "targets",
-            "✅ Досыл отсутствующих запланирован.\n"
-            f"Создано resend-задач: {queued}\n"
-            f"Пропущено (уже accepted/pending): {skipped_connected}\n"
-            f"Пропущено (активная задача/нет auth): {skipped_other}",
+            "✅ Доотправка отсутствующих обработана.\n"
+            f"Всего пар отправитель→ник в цели: {total_pairs}\n"
+            f"Уже покрыто (accepted/pending): {skipped_connected}\n"
+            f"Поставлено в очередь send_request: {queued}\n"
+            f"Не поставлено сейчас (активная задача/нет auth): {skipped_other}\n"
+            f"Осталось к доотправке на сейчас: {need_resend_now}",
         )
         return True
     if text == "🗑️ Удалить из друзей":
@@ -5328,42 +5652,17 @@ def _handle_settings_and_manage_actions(message, text: str, chat_id: int) -> boo
     if text == "👤 Доступ auth":
         show_auth_access_menu(chat_id)
         return True
-    if text == "🧯 Новые заявки":
-        def _toggle(db):
-            cur = is_new_send_requests_enabled(db)
-            set_new_send_requests_enabled(db, not cur)
-            return bool(cur), bool(not cur), bool(is_recheck_only_mode_enabled(db))
-
-        was_enabled, now_enabled, recheck_only = db_exec(_toggle)
-        show_menu_status(
-            chat_id,
-            "settings",
-            "✅ Режим новых заявок обновлён.\n"
-            f"Было: {'включено' if was_enabled else 'выключено'}\n"
-            f"Стало: {'включено' if now_enabled else 'выключено'}\n"
-            f"Recheck-only: {'включен' if recheck_only else 'выключен'}\n"
-            f"ENV send gate: {'включен' if SEND_REQUESTS_ENABLED else 'выключен'}",
-        )
-        return True
-    if text == "♻️ Только recheck":
-        def _toggle(db):
-            cur = is_recheck_only_mode_enabled(db)
-            new_val = not cur
-            set_recheck_only_mode_enabled(db, new_val)
-            # recheck-only подразумевает отключение новых заявок.
-            if new_val:
-                set_new_send_requests_enabled(db, False)
-            return bool(cur), bool(new_val), bool(is_new_send_requests_enabled(db))
-
-        was_enabled, now_enabled, sends_enabled = db_exec(_toggle)
-        show_menu_status(
-            chat_id,
-            "settings",
-            "✅ Режим recheck-only обновлён.\n"
-            f"Было: {'включен' if was_enabled else 'выключен'}\n"
-            f"Стало: {'включен' if now_enabled else 'выключен'}\n"
-            f"Новые заявки: {'включены' if sends_enabled else 'выключены'}\n"
-            f"ENV send gate: {'включен' if SEND_REQUESTS_ENABLED else 'выключен'}",
+    if text in {"🎛️ Режим отправки", "🧯 Новые заявки", "♻️ Только recheck"}:
+        current_mode = db_exec(lambda db: get_send_mode(db))
+        ask_step(
+            message,
+            "Выбери режим отправки:\n"
+            f"Сейчас: {send_mode_label(current_mode)}\n\n"
+            "1 — Новые заявки\n"
+            "2 — Новые + recheck\n"
+            "3 — Только recheck\n\n"
+            "Введи: 1 / 2 / 3",
+            handle_set_send_mode,
         )
         return True
     if text == "➕ Добавить ID auth":
@@ -5413,6 +5712,18 @@ def _handle_settings_and_manage_actions(message, text: str, chat_id: int) -> boo
 def _handle_accounts_actions(message, text: str, chat_id: int) -> bool:
     if text == "📥 Импорт файлов":
         show_menu_status(chat_id, "accounts", "📥 Пришли .xlsx/.txt/.csv файлом в чат.")
+        return True
+    if text == "🔒 Конфиденциальность профиля":
+        ask_step(
+            message,
+            "Массовая смена конфиденциальности профиля Epic.\n\n"
+            "Выбери режим:\n"
+            "1 — Открытый\n"
+            "2 — Закрытый\n"
+            "3 — Только друзья\n\n"
+            "Введи: 1 / 2 / 3",
+            handle_mass_privacy_mode,
+        )
         return True
     if text == "📝 Массовая смена ников":
         show_nickname_change_import_menu(chat_id)
@@ -6559,6 +6870,91 @@ def cb_acc_list(call):
     )
 
 
+@bot.callback_query_handler(func=lambda call: str(getattr(call, "data", "") or "").startswith("acc_pick_priv:"))
+@admin_only_call
+def cb_acc_pick_priv(call):
+    _safe_answer_callback(call)
+    try:
+        account_id = int(str(call.data).split(":", 1)[1])
+    except Exception:
+        show_menu_status(call.message.chat.id, "accounts", "❌ Неверный ID аккаунта.")
+        return
+    show_account_privacy_menu(call.message.chat.id, account_id)
+
+
+@bot.callback_query_handler(func=lambda call: str(getattr(call, "data", "") or "").startswith("acc_set_priv:"))
+@admin_only_call
+def cb_acc_set_priv(call):
+    _safe_answer_callback(call)
+    parts = str(call.data or "").split(":")
+    if len(parts) != 3:
+        show_menu_status(call.message.chat.id, "accounts", "❌ Неверная команда приватности.")
+        return
+    try:
+        account_id = int(parts[1])
+    except Exception:
+        show_menu_status(call.message.chat.id, "accounts", "❌ Неверный ID аккаунта.")
+        return
+
+    level = str(parts[2] or "").strip().upper()
+    if level not in PROFILE_PRIVACY_LABEL_RU:
+        show_menu_status(call.message.chat.id, "accounts", "❌ Неверный режим приватности.")
+        return
+
+    chat_id = call.message.chat.id
+    level_ru = PROFILE_PRIVACY_LABEL_RU.get(level, level)
+    show_account_privacy_menu(chat_id, account_id, status_note=f"⏳ Применяю режим: {level_ru}...")
+
+    def worker():
+        def _load(db):
+            acc = db.query(Account).filter(Account.id == int(account_id)).first()
+            if not acc:
+                return None
+            return {
+                "id": int(acc.id),
+                "login": str(acc.login),
+                "password": str(acc.password),
+                "enabled": bool(acc.enabled),
+                "status": str(acc.status or ""),
+                "epic_account_id": str(acc.epic_account_id or ""),
+                "device_id": str(acc.device_id or ""),
+                "device_secret": str(acc.device_secret or ""),
+            }
+
+        item = db_exec(_load)
+        if not item:
+            show_menu_status(chat_id, "accounts", f"❌ Аккаунт #{account_id} не найден.")
+            return
+        if not bool(item.get("enabled")) or str(item.get("status") or "") != AccountStatus.ACTIVE.value:
+            show_account_privacy_menu(chat_id, account_id, status_note="❌ Аккаунт неактивен.")
+            return
+        if not (item.get("epic_account_id") and item.get("device_id") and item.get("device_secret")):
+            show_account_privacy_menu(chat_id, account_id, status_note="❌ У аккаунта нет device_auth.")
+            return
+
+        proxy_url = db_exec(lambda db: get_proxy_for_account(db, int(account_id)))
+        result = set_profile_privacy_with_device(
+            login=str(item["login"]),
+            password=str(item["password"]),
+            privacy_level=level,
+            proxy_url=proxy_url,
+            epic_account_id=str(item["epic_account_id"] or ""),
+            device_id=str(item["device_id"] or ""),
+            device_secret=str(item["device_secret"] or ""),
+            namespace="Fortnite",
+        )
+        if result.ok:
+            show_account_privacy_menu(chat_id, account_id, status_note=f"✅ Режим приватности обновлён: {level_ru}.")
+            return
+        show_account_privacy_menu(
+            chat_id,
+            account_id,
+            status_note=f"❌ Не удалось обновить приватность: {result.code} ({result.message})",
+        )
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
 @bot.callback_query_handler(func=lambda call: call.data == "acc_banned")
 @admin_only_call
 def cb_acc_banned(call):
@@ -6910,6 +7306,190 @@ def handle_delete_account_single(message):
         "accounts",
         f"✅ Удалено аккаунтов: {deleted}" + (f"\nНе найдено: {missing}" if missing else ""),
     )
+
+
+def _resolve_accounts_for_mass_privacy(db, raw_selector: str) -> tuple[list[dict], list[str], bool]:
+    """
+    Returns:
+    - accounts (list of dict rows),
+    - missing selectors,
+    - is_all_mode.
+    """
+    raw = str(raw_selector or "").strip()
+    all_mode = raw.lower() in {"all", "все", "*"}
+    rows: list[dict] = []
+    missing: list[str] = []
+
+    if all_mode:
+        q = (
+            db.query(Account)
+            .filter(
+                Account.enabled == True,
+                Account.status == AccountStatus.ACTIVE.value,
+                Account.epic_account_id.isnot(None),
+                Account.device_id.isnot(None),
+                Account.device_secret.isnot(None),
+            )
+            .order_by(Account.id.asc())
+        )
+        for acc in q.all():
+            rows.append(
+                {
+                    "id": int(acc.id),
+                    "login": str(acc.login),
+                    "password": str(acc.password),
+                    "enabled": bool(acc.enabled),
+                    "status": str(acc.status or ""),
+                    "epic_account_id": str(acc.epic_account_id or ""),
+                    "device_id": str(acc.device_id or ""),
+                    "device_secret": str(acc.device_secret or ""),
+                }
+            )
+        return rows, missing, True
+
+    items = split_multi_values(raw)
+    if not items:
+        return [], [], False
+
+    seen_ids: set[int] = set()
+    for token in items:
+        acc = None
+        if str(token).isdigit():
+            acc = db.query(Account).filter(Account.id == int(token)).first()
+        if not acc:
+            acc = db.query(Account).filter(Account.login == str(token)).first()
+        if not acc:
+            missing.append(str(token))
+            continue
+        if int(acc.id) in seen_ids:
+            continue
+        seen_ids.add(int(acc.id))
+        rows.append(
+            {
+                "id": int(acc.id),
+                "login": str(acc.login),
+                "password": str(acc.password),
+                "enabled": bool(acc.enabled),
+                "status": str(acc.status or ""),
+                "epic_account_id": str(acc.epic_account_id or ""),
+                "device_id": str(acc.device_id or ""),
+                "device_secret": str(acc.device_secret or ""),
+            }
+        )
+    return rows, missing, False
+
+
+def handle_mass_privacy_mode(message):
+    cleanup_step(message)
+    ok, level, err = parse_profile_privacy_level(message.text or "")
+    if not ok:
+        show_menu_status(message.chat.id, "accounts", f"❌ {err}")
+        return
+    set_chat_ui_value(message.chat.id, "acc_privacy_level", level)
+    label = PROFILE_PRIVACY_LABEL_RU.get(level, level)
+    ask_step(
+        message,
+        f"Выбран режим: {label}\n\n"
+        "Введи `all` для всех активных аккаунтов с device_auth\n"
+        "или список ID/login через запятую/`;`/перенос строки.\n\n"
+        "Примеры:\n"
+        "all\n"
+        "1,2,3\n"
+        "mail1@example.com;mail2@example.com",
+        handle_mass_privacy_accounts,
+        parse_mode="Markdown",
+    )
+
+
+def handle_mass_privacy_accounts(message):
+    cleanup_step(message)
+    chat_id = message.chat.id
+    level = str(get_chat_ui_value(chat_id, "acc_privacy_level", "") or "").strip().upper()
+    if level not in PROFILE_PRIVACY_LABEL_RU:
+        show_menu_status(chat_id, "accounts", "❌ Сначала выбери режим приватности заново.")
+        return
+
+    selected_raw = str(message.text or "").strip()
+
+    def _load(db):
+        return _resolve_accounts_for_mass_privacy(db, selected_raw)
+
+    accounts, missing, all_mode = db_exec(_load)
+    if not accounts:
+        tail = f"\nНе найдены: {', '.join(missing[:10])}" if missing else ""
+        show_menu_status(chat_id, "accounts", f"❌ Нет подходящих аккаунтов для обработки.{tail}")
+        return
+
+    label = PROFILE_PRIVACY_LABEL_RU.get(level, level)
+    show_menu_status(
+        chat_id,
+        "accounts",
+        f"⏳ Запускаю массовое обновление приватности ({label}).\n"
+        f"Аккаунтов в обработке: {len(accounts)}"
+        + ("\nРежим выбора: all" if all_mode else ""),
+    )
+
+    def worker():
+        total = int(len(accounts))
+        done = 0
+        success = 0
+        skipped_inactive = 0
+        skipped_no_auth = 0
+        failed = 0
+        fail_by_code: dict[str, int] = {}
+        for item in accounts:
+            done += 1
+            if not bool(item.get("enabled")) or str(item.get("status") or "") != AccountStatus.ACTIVE.value:
+                skipped_inactive += 1
+                continue
+            if not (item.get("epic_account_id") and item.get("device_id") and item.get("device_secret")):
+                skipped_no_auth += 1
+                continue
+
+            proxy_url = db_exec(lambda db: get_proxy_for_account(db, int(item["id"])))
+            result = set_profile_privacy_with_device(
+                login=str(item["login"]),
+                password=str(item["password"]),
+                privacy_level=level,
+                proxy_url=proxy_url,
+                epic_account_id=str(item["epic_account_id"] or ""),
+                device_id=str(item["device_id"] or ""),
+                device_secret=str(item["device_secret"] or ""),
+                namespace="Fortnite",
+            )
+            if result.ok:
+                success += 1
+            else:
+                failed += 1
+                code = str(result.code or "unknown_error")
+                fail_by_code[code] = int(fail_by_code.get(code, 0) or 0) + 1
+
+            if done % 20 == 0 or done == total:
+                show_menu_status(
+                    chat_id,
+                    "accounts",
+                    f"⏳ Приватность профиля ({label}): {done}/{total}\n"
+                    f"Успешно: {success}, ошибок: {failed}",
+                )
+
+        lines = [
+            f"✅ Массовая смена приватности завершена ({label}).",
+            f"Проверено: {total}",
+            f"Успешно: {success}",
+            f"Пропущено (неактивные): {skipped_inactive}",
+            f"Пропущено (без device_auth): {skipped_no_auth}",
+            f"Ошибок: {failed}",
+        ]
+        if missing:
+            lines.append(f"Не найдены селекторы: {len(missing)}")
+            lines.extend([f"- {x}" for x in missing[:10]])
+        if fail_by_code:
+            lines.append("Ошибки по кодам:")
+            for code, cnt in sorted(fail_by_code.items(), key=lambda x: (-x[1], x[0])):
+                lines.append(f"- {code}: {cnt}")
+        show_menu_status(chat_id, "accounts", "\n".join(lines))
+
+    threading.Thread(target=worker, daemon=True).start()
 
 
 def handle_add_target_single(message):
@@ -7721,6 +8301,36 @@ def handle_set_api_limits(message):
     )
 
 
+def handle_set_send_mode(message):
+    cleanup_step(message)
+    raw = str(message.text or "").strip()
+    mode_by_input = {
+        "1": SEND_MODE_NEW_ONLY,
+        "2": SEND_MODE_NEW_AND_RECHECK,
+        "3": SEND_MODE_RECHECK_ONLY,
+    }
+    mode = mode_by_input.get(raw)
+    if not mode:
+        show_menu_status(
+            message.chat.id,
+            "settings",
+            "❌ Неверный выбор. Введи 1, 2 или 3.",
+        )
+        return
+
+    def _inner(db):
+        set_send_mode(db, mode)
+        return get_send_mode(db)
+
+    applied_mode = db_exec(_inner)
+    show_menu_status(
+        message.chat.id,
+        "settings",
+        "✅ Режим отправки обновлён.\n"
+        f"Текущий режим: {send_mode_label(applied_mode)}",
+    )
+
+
 def _parse_positive_user_id(raw: str) -> int | None:
     try:
         uid = int(str(raw or "").strip())
@@ -8156,6 +8766,8 @@ def create_recheck_tasks_job():
     def _inner(db):
         if not get_setting_bool(db, "processing_enabled", True):
             return 0
+        if not is_recheck_enabled(db):
+            return 0
         today = utc_today().isoformat()
         total_created = 0
         total_counter_value = 0
@@ -8167,17 +8779,25 @@ def create_recheck_tasks_job():
             day_key = f"recheck_counter_day_{camp_id}"
             val_key = f"recheck_counter_value_{camp_id}"
             cursor_key = f"recheck_sender_cursor_{camp_id}"
+            used_key = f"recheck_used_senders_{camp_id}"
             counter_day = get_setting(db, day_key, "")
             counter_val = get_setting_int(db, val_key, 0)
+            used_senders_today = _load_int_set_setting(db, used_key)
             if counter_day != today:
                 counter_day = today
                 counter_val = 0
+                used_senders_today = set()
+            elif counter_val <= 0 and used_senders_today:
+                # Self-heal legacy mismatch (value lost, used-set preserved).
+                counter_val = len(used_senders_today)
 
             daily_senders_limit = max(0, int(camp.recheck_daily_limit or DEFAULT_RECHECK_DAILY_LIMIT))
-            remaining_senders = max(0, daily_senders_limit - counter_val)
+            used_count = max(int(counter_val), len(used_senders_today))
+            remaining_senders = max(0, daily_senders_limit - used_count)
             if remaining_senders <= 0:
                 set_setting(db, day_key, counter_day)
-                set_setting(db, val_key, str(counter_val))
+                set_setting(db, val_key, str(used_count))
+                _save_int_set_setting(db, used_key, used_senders_today)
                 continue
 
             sender_rows = (
@@ -8195,22 +8815,38 @@ def create_recheck_tasks_job():
             )
             if not sender_rows:
                 set_setting(db, day_key, counter_day)
-                set_setting(db, val_key, str(counter_val))
+                set_setting(db, val_key, str(used_count))
+                _save_int_set_setting(db, used_key, used_senders_today)
                 continue
 
-            sender_total = len(sender_rows)
+            sender_ids = [int(x[0]) for x in sender_rows]
+            sender_total = len(sender_ids)
             cursor = max(0, int(get_setting_int(db, cursor_key, 0)))
-            take = min(int(remaining_senders), int(sender_total))
+            available_senders = [sid for sid in sender_ids if sid not in used_senders_today]
+            available_count = len(available_senders)
+            take = min(int(remaining_senders), int(available_count))
+            if take <= 0:
+                set_setting(db, day_key, counter_day)
+                set_setting(db, val_key, str(used_count))
+                _save_int_set_setting(db, used_key, used_senders_today)
+                continue
             start_idx = int(cursor % max(1, sender_total))
 
             selected_senders = []
-            for i in range(int(take)):
-                selected_senders.append(int(sender_rows[(start_idx + i) % sender_total][0]))
-            set_setting(db, cursor_key, str((start_idx + take) % max(1, sender_total)))
+            idx = int(start_idx)
+            visited = 0
+            while visited < int(sender_total) and len(selected_senders) < int(take):
+                sid = int(sender_ids[idx])
+                if sid not in used_senders_today:
+                    selected_senders.append(sid)
+                idx = (idx + 1) % int(sender_total)
+                visited += 1
+            set_setting(db, cursor_key, str(int(idx)))
 
             if not selected_senders:
                 set_setting(db, day_key, counter_day)
-                set_setting(db, val_key, str(counter_val))
+                set_setting(db, val_key, str(used_count))
+                _save_int_set_setting(db, used_key, used_senders_today)
                 continue
 
             rows = (
@@ -8295,9 +8931,11 @@ def create_recheck_tasks_job():
                 touched_senders.add(account_id)
 
             # Counter tracks rechecked senders/day, not raw check tasks.
-            new_counter_val = counter_val + len(touched_senders)
+            used_senders_today.update(int(x) for x in touched_senders)
+            new_counter_val = len(used_senders_today)
             set_setting(db, day_key, counter_day)
             set_setting(db, val_key, str(new_counter_val))
+            _save_int_set_setting(db, used_key, used_senders_today)
             total_created += created
             total_counter_value += new_counter_val
 

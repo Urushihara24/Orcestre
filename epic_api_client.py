@@ -103,6 +103,7 @@ class EpicGamesAPIClient:
     # Bases
     ACCOUNT_BASE = "https://account-public-service-prod.ol.epicgames.com"
     FRIENDS_BASE = "https://friends-public-service-prod.ol.epicgames.com"
+    GLOBAL_PROFILE_BASE = "https://global-profile-service.game-social.epicgames.com"
 
     # OAuth credentials (можно переопределить env, чтобы не хардкодить)
     CLIENT_ID = os.getenv("EPIC_CLIENT_ID", "34a02cf8f4414e29b15921876da36f9a").strip()
@@ -677,6 +678,112 @@ class EpicGamesAPIClient:
 
         return self._with_token_retry(_impl)
 
+    def get_profile_privacy_settings(self, namespace: str = "Fortnite") -> ProviderResult:
+        """Получить настройки приватности профиля."""
+        ns = str(namespace or "").strip() or "Fortnite"
+
+        def _impl(access_token: str, account_id: str) -> ProviderResult:
+            url = f"{self.GLOBAL_PROFILE_BASE}/profile/privacy_settings"
+            headers = {"Authorization": f"Bearer {access_token}"}
+            payload = {"namespace": ns}
+
+            success, resp_data, error_code = self._make_request("PUT", url, headers=headers, json=payload)
+            if not success:
+                if error_code in ("unauthorized", "forbidden"):
+                    return ProviderResult(False, "auth_failed", "Token invalid/expired or access denied")
+                if error_code == "rate_limited":
+                    return ProviderResult(False, "rate_limited", "Rate limited while reading privacy settings")
+                msg = ""
+                if isinstance(resp_data, dict):
+                    msg = (
+                        str(resp_data.get("errorMessage") or "")
+                        or str(resp_data.get("error_description") or "")
+                        or str(resp_data.get("error") or "")
+                    )
+                return ProviderResult(False, error_code, msg or f"Read privacy settings failed: {error_code}")
+
+            settings = {}
+            if isinstance(resp_data, dict):
+                ps = resp_data.get("privacySettings")
+                if isinstance(ps, dict):
+                    settings = ps
+            return ProviderResult(
+                True,
+                "privacy_settings_fetched",
+                "Privacy settings fetched",
+                data={"namespace": ns, "privacy_settings": settings},
+            )
+
+        return self._with_token_retry(_impl)
+
+    def set_profile_privacy_level(self, level: str, namespace: str = "Fortnite") -> ProviderResult:
+        """
+        Массово выставить уровень приватности для ключей profile privacy:
+        playRegion, languages, badges.
+        """
+        lvl = str(level or "").strip().upper()
+        if lvl not in {"PUBLIC", "FRIENDS_ONLY", "PRIVATE"}:
+            return ProviderResult(False, "invalid_privacy_level", "Supported values: PUBLIC, FRIENDS_ONLY, PRIVATE")
+        ns = str(namespace or "").strip() or "Fortnite"
+
+        def _impl(access_token: str, account_id: str) -> ProviderResult:
+            url = f"{self.GLOBAL_PROFILE_BASE}/profile/privacy_settings"
+            headers = {"Authorization": f"Bearer {access_token}"}
+            settings = {
+                "playRegion": lvl,
+                "languages": lvl,
+                "badges": lvl,
+            }
+            # Different backends/versions may expect snake_case or camelCase key.
+            payloads = [
+                {"namespace": ns, "privacy_settings": settings},
+                {"namespace": ns, "privacySettings": settings},
+            ]
+
+            last_resp_data = None
+            last_error_code = "unknown_error"
+            for i, payload in enumerate(payloads):
+                success, resp_data, error_code = self._make_request("POST", url, headers=headers, json=payload)
+                if success:
+                    applied = settings
+                    if isinstance(resp_data, dict):
+                        ps = resp_data.get("privacySettings")
+                        if isinstance(ps, dict) and ps:
+                            applied = ps
+                    return ProviderResult(
+                        True,
+                        "privacy_settings_updated",
+                        "Privacy settings updated",
+                        data={"namespace": ns, "privacy_settings": applied, "level": lvl},
+                    )
+                last_resp_data = resp_data
+                last_error_code = error_code
+                # Try fallback payload only for malformed input-style failures.
+                if i == 0 and error_code in {"bad_request", "invalid_response"}:
+                    continue
+                break
+
+            if last_error_code in ("unauthorized", "forbidden"):
+                return ProviderResult(False, "auth_failed", "Token invalid/expired or access denied")
+            if last_error_code == "rate_limited":
+                return ProviderResult(False, "rate_limited", "Rate limited while updating privacy settings")
+
+            msg = ""
+            if isinstance(last_resp_data, dict):
+                msg = (
+                    str(last_resp_data.get("errorMessage") or "")
+                    or str(last_resp_data.get("error_description") or "")
+                    or str(last_resp_data.get("error") or "")
+                )
+            return ProviderResult(
+                False,
+                last_error_code,
+                msg or f"Update privacy settings failed: {last_error_code}",
+                data=last_resp_data if isinstance(last_resp_data, dict) else None,
+            )
+
+        return self._with_token_retry(_impl)
+
     def send_friend_request(self, target_id: str) -> ProviderResult:
         """Отправить заявку в друзья (idempotent под бота)"""
         if not target_id:
@@ -692,8 +799,28 @@ class EpicGamesAPIClient:
             success, resp_data, error_code = self._make_request("POST", url, headers=headers)
 
             if not success:
-                # Идемпотентность: если уже друзья/уже отправлено, считаем как "request_sent"
-                if error_code in ("conflict", "bad_request"):
+                # Идемпотентность: только когда Epic явно сообщает
+                # "already friends/request already sent".
+                idempotent = False
+                if error_code == "conflict":
+                    idempotent = True
+                elif error_code == "bad_request":
+                    text = ""
+                    if isinstance(resp_data, dict):
+                        text = " ".join(
+                            str(resp_data.get(k) or "")
+                            for k in ("errorCode", "error", "errorMessage", "error_description")
+                        ).lower()
+                    idempotent_hints = (
+                        "already",
+                        "friendship_already",
+                        "already_friends",
+                        "already friend",
+                        "already sent",
+                        "request already",
+                    )
+                    idempotent = any(h in text for h in idempotent_hints)
+                if idempotent:
                     return ProviderResult(
                         True,
                         "request_sent",
@@ -1083,6 +1210,32 @@ def change_display_name_with_device(
         allow_password_fallback=False,
     ) as client:
         return client.change_display_name(str(new_display_name))
+
+
+def set_profile_privacy_with_device(
+    login: str,
+    password: str,
+    privacy_level: str,
+    proxy_url: Optional[str],
+    epic_account_id: Optional[str],
+    device_id: Optional[str],
+    device_secret: Optional[str],
+    namespace: str = "Fortnite",
+) -> ProviderResult:
+    """Изменить приватность профиля с опцией device_auth."""
+    if not all([login, password, privacy_level]):
+        return ProviderResult(False, "missing_params", "login, password, privacy_level are required")
+
+    with EpicGamesAPIClient(
+        login=login,
+        password=password,
+        proxy_url=proxy_url,
+        epic_account_id=epic_account_id or "",
+        device_id=device_id or "",
+        device_secret=device_secret or "",
+        allow_password_fallback=False,
+    ) as client:
+        return client.set_profile_privacy_level(str(privacy_level), namespace=str(namespace or "Fortnite"))
 
 
 # ============================================================
