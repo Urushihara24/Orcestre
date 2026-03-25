@@ -4517,32 +4517,20 @@ def show_campaign_progress(chat_id: int, with_campaign_info: bool = False):
             .group_by(Target.status)
             .all()
         )
-        send_rows = (
-            db.query(Task.target_id, func.count(func.distinct(Task.account_id)))
-            .filter(
-                task_campaign_filter(db, selected_campaign_id),
-                Task.task_type == "send_request",
-                Task.status == TaskStatus.DONE.value,
-            )
-            .group_by(Task.target_id)
-            .all()
-        )
-        send_rows_today = (
-            db.query(Task.target_id, func.count(func.distinct(Task.account_id)))
-            .filter(
-                task_campaign_filter(db, selected_campaign_id),
-                Task.task_type == "send_request",
-                Task.status == TaskStatus.DONE.value,
-                Task.completed_at >= day_start,
-                Task.completed_at < day_end,
-            )
-            .group_by(Task.target_id)
-            .all()
-        )
-        senders_map_total = {int(tid): int(cnt or 0) for tid, cnt in send_rows}
-        senders_map_today = {int(tid): int(cnt or 0) for tid, cnt in send_rows_today}
         repeat_daily = bool(camp.daily_repeat_enabled) if camp is not None else False
-        senders_map = senders_map_today if repeat_daily else senders_map_total
+        # Coverage map must match planner semantics:
+        # sender is considered covering target not only on send DONE, but also on
+        # already-connected/pending precheck and check_status confirmations.
+        senders_map = {}
+        for tid, _, _ in targets:
+            covered_ids = _done_sender_ids_for_target(
+                db,
+                int(tid),
+                camp,
+                now,
+                force_daily_repeat=bool(repeat_daily),
+            )
+            senders_map[int(tid)] = int(len(covered_ids))
         total_send_done = (
             db.query(func.count(Task.id))
             .filter(
