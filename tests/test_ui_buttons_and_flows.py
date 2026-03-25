@@ -1293,7 +1293,8 @@ def test_force_cycle_replaces_known_connected_sender(fresh_main):
     res = m.db_exec(_run)
     assert res.get("ok") is True
     assert int(res.get("created", 0)) == 0
-    assert int(res.get("replaced_connected", 0)) == 1
+    # Connected sender now counts as covered; no replacement needed for req=1.
+    assert int(res.get("replaced_connected", 0)) == 0
 
     queued = m.db_exec(
         lambda db: db.query(m.Task).filter(
@@ -1305,7 +1306,7 @@ def test_force_cycle_replaces_known_connected_sender(fresh_main):
             m.Task.last_error == "replacement_after_manual_connected",
         ).count()
     )
-    assert queued == 1
+    assert queued == 0
 
 
 def test_tgt_distribute_shows_reason_when_zero_created(fresh_main, monkeypatch):
