@@ -3496,17 +3496,11 @@ INLINE_ACTION_TEXT = {
     "goal_nick_statuses": "📄 Статусы по никам",
     "goal_page_prev": "◀️ Страница",
     "goal_page_next": "▶️ Страница",
-    # Backward compatibility for old inline messages.
-    "goal_nick_prev": "◀️ Страница",
-    "goal_nick_next": "▶️ Страница",
     "goal_nick_search": "🔎 Поиск ников",
     "goal_add_nick": "➕ Добавить ник",
     "goal_del_nick": "➖ Удалить ник",
     "goal_distribute": "🚀 Распределить ники",
     "goal_senders_for_nick": "👀 Отправители по нику",
-    # Backward compatibility aliases; unified page arrows are used in menu.
-    "goal_senders_prev": "◀️ Страница",
-    "goal_senders_next": "▶️ Страница",
     "goal_force_one": "⚡ Форс-цикл с аккаунта",
     "goal_force_random": "🎲 Форс-цикл (рандом)",
     "goal_start": "▶️ Запустить цель",
@@ -3516,8 +3510,6 @@ INLINE_ACTION_TEXT = {
     "goal_check_friends": "🔍 Проверить в друзьях",
     "goal_resend_missing": "🔁 Дослать отсутствующих",
     "goal_delete": "🗑️ Удалить цель",
-    # Legacy item, kept for backward compatibility with old inline messages.
-    "goal_limit": "🔄 Лимит слоя",
     "goal_jitter": "⏱️ Джиттер",
     "goal_windows": "🕐 Окна",
     "goal_target_limit": "🎯 На ник",
@@ -3543,6 +3535,16 @@ INLINE_ACTION_TEXT = {
     "proxy_add": "➕ Добавить прокси",
     "proxy_list": "📋 Список прокси",
     "proxy_del": "🗑️ Удалить прокси",
+}
+
+# Legacy callback aliases for old inline messages still visible in chat history.
+# Keep backward compatibility without cluttering the active button map.
+LEGACY_INLINE_ACTION_TEXT = {
+    "goal_nick_prev": "◀️ Страница",
+    "goal_nick_next": "▶️ Страница",
+    "goal_senders_prev": "◀️ Страница",
+    "goal_senders_next": "▶️ Страница",
+    "goal_limit": "🔄 Лимит слоя",
 }
 
 
@@ -3906,12 +3908,17 @@ def show_settings_menu(chat_id: int):
             is_recheck_only_mode_enabled(db),
         )
     )
+    env_gate = "включен" if SEND_REQUESTS_ENABLED else "выключен"
+    env_hint = ""
+    if not SEND_REQUESTS_ENABLED:
+        env_hint = "\n⚠️ ENV-предохранитель отключает реальные отправки."
     show_screen(
         chat_id,
         "⚙️ Настройки\n"
         "Глобальные параметры: API лимиты, прокси, доступ auth.\n"
         f"Новые заявки: {'включены' if sends_enabled else 'выключены'}\n"
-        f"Режим recheck-only: {'включен' if recheck_only else 'выключен'}",
+        f"Режим recheck-only: {'включен' if recheck_only else 'выключен'}\n"
+        f"ENV send gate: {env_gate}{env_hint}",
         reply_markup=kb_settings_reply(),
         parse_mode=None,
         force_new=True,
@@ -4956,7 +4963,7 @@ def cb_inline_action_nav(call):
     _safe_answer_callback(call)
     data = str(call.data or "")
     code = data.split(":", 1)[1] if ":" in data else ""
-    text = INLINE_ACTION_TEXT.get(code)
+    text = INLINE_ACTION_TEXT.get(code) or LEGACY_INLINE_ACTION_TEXT.get(code)
     if not text:
         return
 
@@ -5334,7 +5341,8 @@ def _handle_settings_and_manage_actions(message, text: str, chat_id: int) -> boo
             "✅ Режим новых заявок обновлён.\n"
             f"Было: {'включено' if was_enabled else 'выключено'}\n"
             f"Стало: {'включено' if now_enabled else 'выключено'}\n"
-            f"Recheck-only: {'включен' if recheck_only else 'выключен'}",
+            f"Recheck-only: {'включен' if recheck_only else 'выключен'}\n"
+            f"ENV send gate: {'включен' if SEND_REQUESTS_ENABLED else 'выключен'}",
         )
         return True
     if text == "♻️ Только recheck":
@@ -5354,7 +5362,8 @@ def _handle_settings_and_manage_actions(message, text: str, chat_id: int) -> boo
             "✅ Режим recheck-only обновлён.\n"
             f"Было: {'включен' if was_enabled else 'выключен'}\n"
             f"Стало: {'включен' if now_enabled else 'выключен'}\n"
-            f"Новые заявки: {'включены' if sends_enabled else 'выключены'}",
+            f"Новые заявки: {'включены' if sends_enabled else 'выключены'}\n"
+            f"ENV send gate: {'включен' if SEND_REQUESTS_ENABLED else 'выключен'}",
         )
         return True
     if text == "➕ Добавить ID auth":
@@ -8422,7 +8431,12 @@ def _polling_with_retry():
             raise
         except Exception as e:
             # Network hiccups shouldn't kill the whole app in production.
-            logger.warning(f"Telegram polling error: {e}. Retry in {retry_sec}s.")
+            logger.warning(
+                "Telegram polling error (%s). Retry in %ss.",
+                type(e).__name__,
+                retry_sec,
+                exc_info=True,
+            )
             time.sleep(max(1, retry_sec))
             continue
 
