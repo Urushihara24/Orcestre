@@ -6944,7 +6944,20 @@ def cb_acc_set_priv(call):
             namespace="Fortnite",
         )
         if result.ok:
-            show_account_privacy_menu(chat_id, account_id, status_note=f"✅ Режим приватности обновлён: {level_ru}.")
+            data = result.data or {}
+            effective_level = str(data.get("effective_level") or level).strip().upper() or level
+            effective_ru = PROFILE_PRIVACY_LABEL_RU.get(effective_level, effective_level)
+            if str(result.code or "") == "privacy_settings_updated_limited":
+                show_account_privacy_menu(
+                    chat_id,
+                    account_id,
+                    status_note=(
+                        "⚠️ Режим «Только друзья» недоступен в Epic API.\n"
+                        f"Применён ближайший режим: {effective_ru}."
+                    ),
+                )
+                return
+            show_account_privacy_menu(chat_id, account_id, status_note=f"✅ Режим приватности обновлён: {effective_ru}.")
             return
         show_account_privacy_menu(
             chat_id,
@@ -7433,6 +7446,7 @@ def handle_mass_privacy_accounts(message):
         total = int(len(accounts))
         done = 0
         success = 0
+        limited = 0
         skipped_inactive = 0
         skipped_no_auth = 0
         failed = 0
@@ -7459,6 +7473,8 @@ def handle_mass_privacy_accounts(message):
             )
             if result.ok:
                 success += 1
+                if str(result.code or "") == "privacy_settings_updated_limited":
+                    limited += 1
             else:
                 failed += 1
                 code = str(result.code or "unknown_error")
@@ -7476,6 +7492,7 @@ def handle_mass_privacy_accounts(message):
             f"✅ Массовая смена приватности завершена ({label}).",
             f"Проверено: {total}",
             f"Успешно: {success}",
+            f"Из них с ограничением API (режим «Только друзья» -> «Закрытый»): {limited}",
             f"Пропущено (неактивные): {skipped_inactive}",
             f"Пропущено (без device_auth): {skipped_no_auth}",
             f"Ошибок: {failed}",
