@@ -65,6 +65,34 @@ class TestEpicApiClient(unittest.TestCase):
                 self.assertEqual(r.code, "request_sent")
                 self.assertEqual((r.data or {}).get("note"), "idempotent_success")
 
+    def test_send_friend_request_bad_request_is_idempotent_only_with_already_hints(self):
+        import epic_api_client as c
+
+        client = c.EpicGamesAPIClient(login="x", password="y", proxy_url=None, epic_account_id="me", device_id="d", device_secret="s")
+
+        def passthrough(fn):
+            return fn("TOKEN", "ME")
+
+        with mock.patch.object(client, "_with_token_retry", side_effect=passthrough):
+            with mock.patch.object(
+                client,
+                "_make_request",
+                return_value=(False, {"errorMessage": "Request already sent to this user"}, "bad_request"),
+            ):
+                r = client.send_friend_request("T")
+                self.assertTrue(r.ok)
+                self.assertEqual(r.code, "request_sent")
+                self.assertEqual((r.data or {}).get("note"), "idempotent_success")
+
+            with mock.patch.object(
+                client,
+                "_make_request",
+                return_value=(False, {"errorMessage": "operation blocked by policy"}, "bad_request"),
+            ):
+                r = client.send_friend_request("T")
+                self.assertFalse(r.ok)
+                self.assertEqual(r.code, "bad_request")
+
     def test_ensure_token_no_password_fallback_when_disabled(self):
         import epic_api_client as c
 
@@ -96,3 +124,43 @@ class TestEpicApiClient(unittest.TestCase):
             r = client._auth_password()
             self.assertFalse(r.ok)
             self.assertEqual(r.code, "password_grant_blocked")
+
+    def test_set_profile_privacy_level_success(self):
+        import epic_api_client as c
+
+        client = c.EpicGamesAPIClient(
+            login="x",
+            password="y",
+            proxy_url=None,
+            epic_account_id="me",
+            device_id="d",
+            device_secret="s",
+        )
+
+        def passthrough(fn):
+            return fn("TOKEN", "ME")
+
+        captured = {}
+
+        def _req(method, url, **kwargs):
+            captured["method"] = method
+            captured["url"] = url
+            captured["json"] = kwargs.get("json")
+            return True, {"privacySettings": {"playRegion": "PRIVATE", "languages": "PRIVATE", "badges": "PRIVATE"}}, "ok"
+
+        with mock.patch.object(client, "_with_token_retry", side_effect=passthrough):
+            with mock.patch.object(client, "_make_request", side_effect=_req):
+                r = client.set_profile_privacy_level("PRIVATE")
+                self.assertTrue(r.ok)
+                self.assertEqual(r.code, "privacy_settings_updated")
+                self.assertEqual(captured["method"], "POST")
+                self.assertIn("/profile/privacy_settings", captured["url"])
+                self.assertEqual((captured["json"] or {}).get("namespace"), "Fortnite")
+
+    def test_set_profile_privacy_level_rejects_invalid_value(self):
+        import epic_api_client as c
+
+        client = c.EpicGamesAPIClient(login="x", password="y", proxy_url=None)
+        r = client.set_profile_privacy_level("UNKNOWN")
+        self.assertFalse(r.ok)
+        self.assertEqual(r.code, "invalid_privacy_level")

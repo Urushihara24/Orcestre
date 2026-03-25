@@ -163,6 +163,8 @@ def test_press_all_buttons_smoke(fresh_main, monkeypatch, tmp_path):
     m.cb_acc_device_cancel(_call(data="acc_device_cancel:1", message_id=555))
     m.cb_acc_device_show_login(_call(data="acc_device_show_login:1", message_id=556))
     m.cb_acc_device_show_pass(_call(data="acc_device_show_pass:1", message_id=557))
+    m.cb_acc_pick_priv(_call(data="acc_pick_priv:1", message_id=558))
+    m.cb_acc_set_priv(_call(data="acc_set_priv:1:PRIVATE", message_id=559))
 
     # Targets
     m.cb_tgt_import(_call(data="tgt_import"))
@@ -342,6 +344,59 @@ def test_add_same_nick_in_different_goals_via_ui_handler(fresh_main, monkeypatch
     assert count == 2
 
 
+def test_mass_profile_privacy_flow_all_accounts(fresh_main, monkeypatch):
+    m = fresh_main
+    statuses = []
+    asks = []
+
+    monkeypatch.setattr(m, "cleanup_step", lambda *a, **k: None, raising=True)
+    monkeypatch.setattr(
+        m,
+        "show_menu_status",
+        lambda chat_id, menu_key, status_text: statuses.append((chat_id, menu_key, status_text)),
+        raising=True,
+    )
+    monkeypatch.setattr(
+        m,
+        "ask_step",
+        lambda message, prompt_text, next_handler, parse_mode=None: asks.append(
+            (message.chat.id, prompt_text, next_handler.__name__)
+        ),
+        raising=True,
+    )
+
+    # Step 1: choose mode.
+    m.handle_mass_privacy_mode(_msg(chat_id=55, text="2"))
+    assert asks and asks[-1][2] == "handle_mass_privacy_accounts"
+
+    # Step 2: process all eligible accounts.
+    def _seed(db):
+        db.add(
+            m.Account(
+                id=501,
+                login="priv@example.com",
+                password="pass",
+                enabled=True,
+                status=m.AccountStatus.ACTIVE.value,
+                epic_account_id="epic-501",
+                device_id="dev-501",
+                device_secret="sec-501",
+            )
+        )
+        db.commit()
+
+    m.db_exec(_seed)
+    monkeypatch.setattr(m.threading, "Thread", ImmediateThread, raising=True)
+    monkeypatch.setattr(
+        m,
+        "set_profile_privacy_with_device",
+        lambda **kwargs: SimpleNamespace(ok=True, code="privacy_settings_updated", message="ok"),
+        raising=True,
+    )
+    m.handle_mass_privacy_accounts(_msg(chat_id=55, text="all"))
+    assert any("Массовая смена приватности завершена" in txt for _, _, txt in statuses)
+
+
 def test_reply_nav_routes_new_pagination_search_and_progress(fresh_main, monkeypatch):
     m = fresh_main
 
@@ -503,10 +558,11 @@ def test_show_targets_status_and_campaign_progress(fresh_main, monkeypatch):
     m.show_campaign_progress(chat_id)
     progress_text = fb.sent[-1][1]
     assert "📈 Прогресс текущей цели" in progress_text
-    assert "Целей: 2" in progress_text
-    assert "Покрытие отправителей (всего): 1/3" in progress_text
-    assert "Самый покрытый ник: 1/2 отправителей" in progress_text
-    assert "Осталось до исчерпания пула: 1" in progress_text
+    assert "• Ников всего: 2" in progress_text
+    assert "• Закрыто пар аккаунт→ник (всего): 1/3" in progress_text
+    assert "• Осталось пар до полного покрытия: 2" in progress_text
+    assert "• Новых заявок отправлено сегодня (DONE send_request): 1" in progress_text
+    assert "• Recheck сегодня: 0/0 отправителей" in progress_text
 
 
 def test_show_targets_receiver_stats_lists_per_nick_metrics(fresh_main, monkeypatch):
@@ -1587,3 +1643,61 @@ def test_goal_edit_menu_routes_to_goal_specific_handlers(fresh_main, monkeypatch
     assert "ручной" in status_calls[0][2].lower()
     assert asked[0][1] == "handle_set_goal_jitter"
     assert asked[1][1] == "handle_set_goal_windows"
+
+
+def test_settings_menu_shows_snapshot_block(fresh_main, monkeypatch):
+    m = fresh_main
+    fb = FakeBot()
+    monkeypatch.setattr(m, "bot", fb, raising=True)
+    monkeypatch.setattr(m.threading, "Timer", FakeTimer, raising=True)
+
+    def _seed(db):
+        m.set_setting(db, "min_request_interval_sec", "40")
+        m.set_setting(db, "hourly_api_limit", "30")
+        m.set_setting(db, "daily_api_limit", "500")
+        m.set_setting(db, m.AUTH_OPERATOR_IDS_SETTING_KEY, "100,200")
+        m.set_send_mode(db, m.SEND_MODE_NEW_AND_RECHECK)
+        db.add(m.Proxy(url="http://proxy1:8080", enabled=True))
+        db.add(m.Proxy(url="http://proxy2:8080", enabled=False))
+        db.commit()
+
+    m.db_exec(_seed)
+
+    m.show_settings_menu(chat_id=7001)
+    txt = fb.sent[-1][1]
+    assert "Текущие общие настройки:" in txt
+    assert "• API: интервал 40с, в час 30, в сутки 500" in txt
+    assert "• Режим отправки: Новые + recheck" in txt
+    assert "• Прокси: 1/2 активных" in txt
+    assert "• Доступ auth: 2 ID" in txt
+
+
+def test_handle_set_send_mode_switches_three_modes(fresh_main, monkeypatch):
+    m = fresh_main
+    monkeypatch.setattr(m, "cleanup_step", lambda *a, **k: None, raising=True)
+
+    statuses = []
+    monkeypatch.setattr(
+        m,
+        "show_menu_status",
+        lambda chat_id, menu_key, status_text: statuses.append((chat_id, menu_key, status_text)),
+        raising=True,
+    )
+
+    chat_id = 7002
+
+    m.handle_set_send_mode(_msg(chat_id=chat_id, text="1"))
+    mode1 = m.db_exec(lambda db: m.get_send_mode(db))
+    assert mode1 == m.SEND_MODE_NEW_ONLY
+
+    m.handle_set_send_mode(_msg(chat_id=chat_id, text="2"))
+    mode2 = m.db_exec(lambda db: m.get_send_mode(db))
+    assert mode2 == m.SEND_MODE_NEW_AND_RECHECK
+
+    m.handle_set_send_mode(_msg(chat_id=chat_id, text="3"))
+    mode3 = m.db_exec(lambda db: m.get_send_mode(db))
+    assert mode3 == m.SEND_MODE_RECHECK_ONLY
+
+    assert statuses
+    assert statuses[-1][1] == "settings"
+    assert "Только recheck" in statuses[-1][2]

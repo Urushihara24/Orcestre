@@ -231,6 +231,7 @@ class TestMainAdditional(unittest.TestCase):
             db.add(acc)
             db.commit()
             db.refresh(acc)
+            acc_id = int(acc.id)
 
             m.set_setting(db, "min_request_interval_sec", "40")
             m.set_setting(db, "hourly_api_limit", "40")
@@ -452,6 +453,7 @@ class TestMainAdditional(unittest.TestCase):
             db.add(tgt)
             db.commit()
             db.refresh(tgt)
+            tgt_id = int(tgt.id)
 
             older_running = m.Task(
                 task_type="send_request",
@@ -782,6 +784,94 @@ class TestMainAdditional(unittest.TestCase):
         finally:
             db.close()
 
+    def test_create_recheck_tasks_job_does_not_repeat_same_sender_same_day(self):
+        m = self.main
+        db = m.SessionLocal()
+        try:
+            now = m.utc_now()
+            camp = m.Campaign(name="goal_recheck_no_repeat_same_day", enabled=True, recheck_daily_limit=100, jitter_min_sec=0, jitter_max_sec=0)
+            db.add(camp)
+            db.commit()
+            db.refresh(camp)
+            camp_id = int(camp.id)
+
+            acc = m.Account(
+                login="recheck_no_repeat@example.com",
+                password="x",
+                enabled=True,
+                status="active",
+                epic_account_id="e1",
+                device_id="d1",
+                device_secret="s1",
+                daily_limit=500,
+                today_sent=0,
+                active_windows_json="[]",
+            )
+            db.add(acc)
+            db.commit()
+            db.refresh(acc)
+            acc_id = int(acc.id)
+
+            tgt = m.Target(
+                username="recheck_no_repeat_nick",
+                campaign_id=camp_id,
+                status=m.TargetStatus.PENDING.value,
+                required_senders=1,
+            )
+            db.add(tgt)
+            db.commit()
+            db.refresh(tgt)
+            tgt_id = int(tgt.id)
+
+            db.add(
+                m.Task(
+                    task_type="send_request",
+                    status=m.TaskStatus.DONE.value,
+                    campaign_id=camp_id,
+                    account_id=acc_id,
+                    target_id=tgt_id,
+                    scheduled_for=now,
+                    completed_at=now,
+                )
+            )
+            db.commit()
+        finally:
+            db.close()
+
+        created_first = m.create_recheck_tasks_job()
+        self.assertEqual(created_first, 1)
+
+        # Simulate worker processed the first check already (no active check remains).
+        db = m.SessionLocal()
+        try:
+            check = (
+                db.query(m.Task)
+                .filter(
+                    m.Task.task_type == "check_status",
+                    m.Task.campaign_id == camp_id,
+                    m.Task.account_id == acc_id,
+                    m.Task.target_id == tgt_id,
+                )
+                .first()
+            )
+            self.assertIsNotNone(check)
+            check.status = m.TaskStatus.DONE.value
+            check.completed_at = m.utc_now()
+            db.commit()
+        finally:
+            db.close()
+
+        created_second = m.create_recheck_tasks_job()
+        self.assertEqual(created_second, 0)
+
+        db = m.SessionLocal()
+        try:
+            self.assertEqual(m.get_setting_int(db, f"recheck_counter_value_{camp_id}", 0), 1)
+            used = m._load_int_set_setting(db, f"recheck_used_senders_{camp_id}")
+            self.assertEqual(used, {acc_id})
+        finally:
+            db.close()
+
     def test_process_check_status_requeues_send_when_friendship_lost(self):
         m = self.main
         db = m.SessionLocal()
@@ -810,6 +900,97 @@ class TestMainAdditional(unittest.TestCase):
                 status=m.TargetStatus.ACCEPTED.value,
                 required_senders=1,
                 accepted_count=1,
+            )
+            db.add(t)
+            db.commit()
+            db.refresh(t)
+
+            db.add(
+                m.Task(
+                    task_type="check_status",
+                    status=m.TaskStatus.DONE.value,
+                    campaign_id=int(c.id),
+                    account_id=int(acc.id),
+                    target_id=int(t.id),
+                    scheduled_for=m.utc_now() - timedelta(hours=2),
+                    completed_at=m.utc_now() - timedelta(hours=2),
+                    max_attempts=3,
+                    last_error="friend_status:accepted",
+                )
+            )
+            db.add(
+                m.Task(
+                    task_type="check_status",
+                    status=m.TaskStatus.QUEUED.value,
+                    campaign_id=int(c.id),
+                    account_id=int(acc.id),
+                    target_id=int(t.id),
+                    scheduled_for=m.utc_now() - timedelta(seconds=1),
+                    max_attempts=3,
+                )
+            )
+            db.commit()
+            camp_id = int(c.id)
+            acc_id = int(acc.id)
+            tgt_id = int(t.id)
+        finally:
+            db.close()
+
+        with (
+            mock.patch.object(m, "DRY_RUN", False),
+            mock.patch.object(m, "enforce_api_rate_limit", return_value=(True, None, "")),
+            mock.patch.object(
+                m,
+                "check_friend_status_with_device",
+                return_value=SimpleNamespace(ok=True, code="rejected", message="not friends"),
+            ),
+        ):
+            m.process_tasks_job()
+
+        db = m.SessionLocal()
+        try:
+            resend = db.query(m.Task).filter(
+                m.Task.task_type == "send_request",
+                m.Task.campaign_id == camp_id,
+                m.Task.account_id == acc_id,
+                m.Task.target_id == tgt_id,
+                m.Task.status == m.TaskStatus.QUEUED.value,
+                m.Task.last_error == "recheck_resend",
+            ).first()
+            tgt = db.query(m.Target).filter(m.Target.id == tgt_id).first()
+            self.assertIsNotNone(resend)
+            self.assertEqual(tgt.status, m.TargetStatus.PENDING.value)
+        finally:
+            db.close()
+
+    def test_process_check_status_does_not_requeue_when_pair_was_not_accepted(self):
+        m = self.main
+        db = m.SessionLocal()
+        try:
+            acc = m.Account(
+                login="lost_friend_no_pair@example.com",
+                password="x",
+                enabled=True,
+                status="active",
+                epic_account_id="e2",
+                device_id="d2",
+                device_secret="s2",
+                daily_limit=500,
+                today_sent=0,
+                active_windows_json="[]",
+            )
+            c = m.Campaign(name="goal_lost_friend_no_pair", enabled=True, jitter_min_sec=0, jitter_max_sec=0)
+            db.add_all([acc, c])
+            db.commit()
+            db.refresh(acc)
+            db.refresh(c)
+
+            t = m.Target(
+                username="lost_friend_target_no_pair",
+                campaign_id=int(c.id),
+                status=m.TargetStatus.ACCEPTED.value,
+                required_senders=1,
+                accepted_count=1,  # accepted exists on goal level, but not for this sender pair
             )
             db.add(t)
             db.commit()
@@ -854,8 +1035,6 @@ class TestMainAdditional(unittest.TestCase):
                 m.Task.status == m.TaskStatus.QUEUED.value,
                 m.Task.last_error == "recheck_resend",
             ).first()
-            tgt = db.query(m.Target).filter(m.Target.id == tgt_id).first()
-            self.assertIsNotNone(resend)
-            self.assertEqual(tgt.status, m.TargetStatus.PENDING.value)
+            self.assertIsNone(resend)
         finally:
             db.close()
