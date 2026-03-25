@@ -99,6 +99,9 @@ def test_sender_first_auto_raises_layer_limit_to_cover_all_nicks(fresh_main):
         db.commit()
         db.refresh(camp)
         camp_id = int(camp.id)
+        # Simulate production-like clamp that previously caused sender overlap.
+        m.set_setting(db, "sender_switch_min_sec", "0")
+        m.set_setting(db, "sender_switch_max_sec", "60")
 
         acc1 = m.Account(
             login="layer_a1@example.com",
