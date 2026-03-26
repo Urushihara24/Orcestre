@@ -163,8 +163,6 @@ def test_press_all_buttons_smoke(fresh_main, monkeypatch, tmp_path):
     m.cb_acc_device_cancel(_call(data="acc_device_cancel:1", message_id=555))
     m.cb_acc_device_show_login(_call(data="acc_device_show_login:1", message_id=556))
     m.cb_acc_device_show_pass(_call(data="acc_device_show_pass:1", message_id=557))
-    m.cb_acc_pick_priv(_call(data="acc_pick_priv:1", message_id=558))
-    m.cb_acc_set_priv(_call(data="acc_set_priv:1:PRIVATE", message_id=559))
 
     # Targets
     m.cb_tgt_import(_call(data="tgt_import"))
@@ -342,59 +340,6 @@ def test_add_same_nick_in_different_goals_via_ui_handler(fresh_main, monkeypatch
 
     count = m.db_exec(lambda db: db.query(m.Target).filter(m.Target.username == "same_ui_nick").count())
     assert count == 2
-
-
-def test_mass_profile_privacy_flow_all_accounts(fresh_main, monkeypatch):
-    m = fresh_main
-    statuses = []
-    asks = []
-
-    monkeypatch.setattr(m, "cleanup_step", lambda *a, **k: None, raising=True)
-    monkeypatch.setattr(
-        m,
-        "show_menu_status",
-        lambda chat_id, menu_key, status_text: statuses.append((chat_id, menu_key, status_text)),
-        raising=True,
-    )
-    monkeypatch.setattr(
-        m,
-        "ask_step",
-        lambda message, prompt_text, next_handler, parse_mode=None: asks.append(
-            (message.chat.id, prompt_text, next_handler.__name__)
-        ),
-        raising=True,
-    )
-
-    # Step 1: choose mode.
-    m.handle_mass_privacy_mode(_msg(chat_id=55, text="2"))
-    assert asks and asks[-1][2] == "handle_mass_privacy_accounts"
-
-    # Step 2: process all eligible accounts.
-    def _seed(db):
-        db.add(
-            m.Account(
-                id=501,
-                login="priv@example.com",
-                password="pass",
-                enabled=True,
-                status=m.AccountStatus.ACTIVE.value,
-                epic_account_id="epic-501",
-                device_id="dev-501",
-                device_secret="sec-501",
-            )
-        )
-        db.commit()
-
-    m.db_exec(_seed)
-    monkeypatch.setattr(m.threading, "Thread", ImmediateThread, raising=True)
-    monkeypatch.setattr(
-        m,
-        "set_profile_privacy_with_device",
-        lambda **kwargs: SimpleNamespace(ok=True, code="privacy_settings_updated", message="ok"),
-        raising=True,
-    )
-    m.handle_mass_privacy_accounts(_msg(chat_id=55, text="all"))
-    assert any("Массовая смена приватности завершена" in txt for _, _, txt in statuses)
 
 
 def test_reply_nav_routes_new_pagination_search_and_progress(fresh_main, monkeypatch):

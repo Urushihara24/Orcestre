@@ -34,7 +34,6 @@ from epic_api_client import (
     remove_friend_with_device,
     verify_account_health_with_device,
     change_display_name_with_device,
-    set_profile_privacy_with_device,
 )
 from epic_device_auth import EpicDeviceAuthGenerator, append_device_auth_to_file
 from campaign_settings import (
@@ -251,16 +250,6 @@ PRECHECK_SKIP_REASONS = (
     "idempotent_request_skip",
     "idempotent_request_skip_requeued",
 )
-
-PROFILE_PRIVACY_LEVEL_PUBLIC = "PUBLIC"
-PROFILE_PRIVACY_LEVEL_FRIENDS_ONLY = "FRIENDS_ONLY"
-PROFILE_PRIVACY_LEVEL_PRIVATE = "PRIVATE"
-PROFILE_PRIVACY_LABEL_RU = {
-    PROFILE_PRIVACY_LEVEL_PUBLIC: "Открытый",
-    PROFILE_PRIVACY_LEVEL_FRIENDS_ONLY: "Только друзья",
-    PROFILE_PRIVACY_LEVEL_PRIVATE: "Закрытый",
-}
-
 
 def target_status_ru(code: str) -> str:
     return TARGET_STATUS_RU.get(code, code or "неизвестно")
@@ -665,22 +654,6 @@ def validate_requested_nickname(raw_value: str) -> tuple[bool, str]:
     if not NICKNAME_ALLOWED_RE.fullmatch(nickname):
         return False, "формат: только латиница/цифры/_ и длина 3..16"
     return True, ""
-
-
-def parse_profile_privacy_level(raw_value: str) -> tuple[bool, str, str]:
-    """
-    Returns: (ok, level_code, error_message)
-    level_code in: PUBLIC / FRIENDS_ONLY / PRIVATE
-    """
-    raw = str(raw_value or "").strip()
-    norm = raw.lower()
-    if norm in {"1", "open", "public", "открытый", "открыт", "публичный", "паблик"}:
-        return True, PROFILE_PRIVACY_LEVEL_PUBLIC, ""
-    if norm in {"2", "closed", "private", "закрытый", "закрыт", "приватный", "приват"}:
-        return True, PROFILE_PRIVACY_LEVEL_PRIVATE, ""
-    if norm in {"3", "friends", "friends_only", "друзья", "только друзья"}:
-        return True, PROFILE_PRIVACY_LEVEL_FRIENDS_ONLY, ""
-    return False, "", "Введи 1/2/3 или open/closed/friends"
 
 
 def _nickname_fallback_candidates(nickname: str, limit: int = NICKNAME_FALLBACK_LIMIT) -> list[str]:
@@ -3662,7 +3635,6 @@ INLINE_ACTION_TEXT = {
     "acc_device": "🔐 Авторизация Epic (ссылка)",
     "acc_check": "✅ Проверить аккаунты",
     "acc_refresh_names": "🔄 Обновить ники Epic",
-    "acc_privacy_bulk": "📩 Режим входящих заявок",
     "acc_nick_change_import": "📝 Массовая смена ников",
     "acc_nick_change_status": "📊 Статус смены ников",
     "acc_add": "➕ Добавить аккаунт",
@@ -3789,22 +3761,6 @@ def kb_accounts_list_reply(accounts: list[Account]) -> types.InlineKeyboardMarku
     m.add(_act_btn("acc_prev"), _act_btn("acc_next"))
     m.add(_act_btn("acc_search"))
     m.add(_act_btn("back"))
-    return m
-
-
-def kb_account_privacy_one_reply(account_id: int) -> types.InlineKeyboardMarkup:
-    m = types.InlineKeyboardMarkup(row_width=2)
-    m.add(
-        types.InlineKeyboardButton(
-            "🌐 Принимать от всех",
-            callback_data=f"acc_set_priv:{int(account_id)}:{PROFILE_PRIVACY_LEVEL_PUBLIC}",
-        ),
-        types.InlineKeyboardButton(
-            "🔒 Не принимать",
-            callback_data=f"acc_set_priv:{int(account_id)}:{PROFILE_PRIVACY_LEVEL_PRIVATE}",
-        ),
-    )
-    m.add(types.InlineKeyboardButton("⬅️ К списку аккаунтов", callback_data="acc_list"))
     return m
 
 
@@ -4525,53 +4481,6 @@ def show_accounts_list(chat_id: int, page: int = 1, query: str = ""):
     if len(text) > 3800:
         text = text[:3790] + "…"
     show_screen(chat_id, text, reply_markup=kb_accounts_list_reply(accs), parse_mode="Markdown", force_new=True)
-
-
-def show_account_privacy_menu(chat_id: int, account_id: int, status_note: str = ""):
-    def _inner(db):
-        acc = db.query(Account).filter(Account.id == int(account_id)).first()
-        if not acc:
-            return None
-        sender_label = str(getattr(acc, "epic_display_name", "") or "").strip() or str(acc.login or "")
-        has_da = bool(acc.epic_account_id and acc.device_id and acc.device_secret)
-        return {
-            "id": int(acc.id),
-            "login": str(acc.login),
-            "label": sender_label,
-            "enabled": bool(acc.enabled),
-            "status": str(acc.status or ""),
-            "has_da": has_da,
-        }
-
-    row = db_exec(_inner)
-    if not row:
-        show_menu_status(chat_id, "accounts", f"❌ Аккаунт #{account_id} не найден.")
-        return
-
-    lines = [
-        "📩 Входящие заявки в друзья (Epic)",
-        f"Аккаунт: {row['label']}",
-        f"Логин: {row['login']}",
-        f"Статус: {'активен' if row['enabled'] and row['status'] == AccountStatus.ACTIVE.value else row['status']}",
-        f"Device auth: {'есть' if row['has_da'] else 'нет'}",
-        "",
-        "Настройка влияет только на приём входящих заявок.",
-        "Это НЕ приватность списка друзей/достижений Epic.",
-        "",
-        "Выбери режим:",
-        "• 🌐 Принимать заявки от всех",
-        "• 🔒 Не принимать заявки",
-    ]
-    if status_note:
-        lines.extend(["", status_note])
-
-    show_screen(
-        chat_id,
-        "\n".join(lines),
-        reply_markup=kb_account_privacy_one_reply(int(account_id)),
-        parse_mode=None,
-        force_new=True,
-    )
 
 
 def show_targets_status(chat_id: int, page: int = 1, query: str = ""):
@@ -5729,13 +5638,6 @@ def _handle_accounts_actions(message, text: str, chat_id: int) -> bool:
     if text == "📥 Импорт файлов":
         show_menu_status(chat_id, "accounts", "📥 Пришли .xlsx/.txt/.csv файлом в чат.")
         return True
-    if text in {"🔒 Конфиденциальность профиля", "📩 Режим входящих заявок"}:
-        show_menu_status(
-            chat_id,
-            "accounts",
-            "ℹ️ Функция переключения приватности отключена: Epic API не даёт стабильно управлять нужной приватностью через device_auth.",
-        )
-        return True
     if text == "📝 Массовая смена ников":
         show_nickname_change_import_menu(chat_id)
         return True
@@ -6881,28 +6783,6 @@ def cb_acc_list(call):
     )
 
 
-@bot.callback_query_handler(func=lambda call: str(getattr(call, "data", "") or "").startswith("acc_pick_priv:"))
-@admin_only_call
-def cb_acc_pick_priv(call):
-    _safe_answer_callback(call)
-    show_menu_status(
-        call.message.chat.id,
-        "accounts",
-        "ℹ️ Функция переключения приватности отключена: Epic API не даёт стабильно управлять нужной приватностью через device_auth.",
-    )
-
-
-@bot.callback_query_handler(func=lambda call: str(getattr(call, "data", "") or "").startswith("acc_set_priv:"))
-@admin_only_call
-def cb_acc_set_priv(call):
-    _safe_answer_callback(call)
-    show_menu_status(
-        call.message.chat.id,
-        "accounts",
-        "ℹ️ Функция переключения приватности отключена: Epic API не даёт стабильно управлять нужной приватностью через device_auth.",
-    )
-
-
 @bot.callback_query_handler(func=lambda call: call.data == "acc_banned")
 @admin_only_call
 def cb_acc_banned(call):
@@ -7254,194 +7134,6 @@ def handle_delete_account_single(message):
         "accounts",
         f"✅ Удалено аккаунтов: {deleted}" + (f"\nНе найдено: {missing}" if missing else ""),
     )
-
-
-def _resolve_accounts_for_mass_privacy(db, raw_selector: str) -> tuple[list[dict], list[str], bool]:
-    """
-    Returns:
-    - accounts (list of dict rows),
-    - missing selectors,
-    - is_all_mode.
-    """
-    raw = str(raw_selector or "").strip()
-    all_mode = raw.lower() in {"all", "все", "*"}
-    rows: list[dict] = []
-    missing: list[str] = []
-
-    if all_mode:
-        q = (
-            db.query(Account)
-            .filter(
-                Account.enabled == True,
-                Account.status == AccountStatus.ACTIVE.value,
-                Account.epic_account_id.isnot(None),
-                Account.device_id.isnot(None),
-                Account.device_secret.isnot(None),
-            )
-            .order_by(Account.id.asc())
-        )
-        for acc in q.all():
-            rows.append(
-                {
-                    "id": int(acc.id),
-                    "login": str(acc.login),
-                    "password": str(acc.password),
-                    "enabled": bool(acc.enabled),
-                    "status": str(acc.status or ""),
-                    "epic_account_id": str(acc.epic_account_id or ""),
-                    "device_id": str(acc.device_id or ""),
-                    "device_secret": str(acc.device_secret or ""),
-                }
-            )
-        return rows, missing, True
-
-    items = split_multi_values(raw)
-    if not items:
-        return [], [], False
-
-    seen_ids: set[int] = set()
-    for token in items:
-        acc = None
-        if str(token).isdigit():
-            acc = db.query(Account).filter(Account.id == int(token)).first()
-        if not acc:
-            acc = db.query(Account).filter(Account.login == str(token)).first()
-        if not acc:
-            missing.append(str(token))
-            continue
-        if int(acc.id) in seen_ids:
-            continue
-        seen_ids.add(int(acc.id))
-        rows.append(
-            {
-                "id": int(acc.id),
-                "login": str(acc.login),
-                "password": str(acc.password),
-                "enabled": bool(acc.enabled),
-                "status": str(acc.status or ""),
-                "epic_account_id": str(acc.epic_account_id or ""),
-                "device_id": str(acc.device_id or ""),
-                "device_secret": str(acc.device_secret or ""),
-            }
-        )
-    return rows, missing, False
-
-
-def handle_mass_privacy_mode(message):
-    cleanup_step(message)
-    ok, level, err = parse_profile_privacy_level(message.text or "")
-    if not ok:
-        show_menu_status(message.chat.id, "accounts", f"❌ {err}")
-        return
-    set_chat_ui_value(message.chat.id, "acc_privacy_level", level)
-    label = PROFILE_PRIVACY_LABEL_RU.get(level, level)
-    ask_step(
-        message,
-        f"Выбран режим: {label}\n\n"
-        "Введи `all` для всех активных аккаунтов с device_auth\n"
-        "или список ID/login через запятую/`;`/перенос строки.\n\n"
-        "Примеры:\n"
-        "all\n"
-        "1,2,3\n"
-        "mail1@example.com;mail2@example.com",
-        handle_mass_privacy_accounts,
-        parse_mode=None,
-    )
-
-
-def handle_mass_privacy_accounts(message):
-    cleanup_step(message)
-    chat_id = message.chat.id
-    level = str(get_chat_ui_value(chat_id, "acc_privacy_level", "") or "").strip().upper()
-    if level not in PROFILE_PRIVACY_LABEL_RU:
-        show_menu_status(chat_id, "accounts", "❌ Сначала выбери режим приватности заново.")
-        return
-
-    selected_raw = str(message.text or "").strip()
-
-    def _load(db):
-        return _resolve_accounts_for_mass_privacy(db, selected_raw)
-
-    accounts, missing, all_mode = db_exec(_load)
-    if not accounts:
-        tail = f"\nНе найдены: {', '.join(missing[:10])}" if missing else ""
-        show_menu_status(chat_id, "accounts", f"❌ Нет подходящих аккаунтов для обработки.{tail}")
-        return
-
-    label = PROFILE_PRIVACY_LABEL_RU.get(level, level)
-    show_menu_status(
-        chat_id,
-        "accounts",
-        f"⏳ Запускаю массовое обновление приватности ({label}).\n"
-        f"Аккаунтов в обработке: {len(accounts)}"
-        + ("\nРежим выбора: all" if all_mode else ""),
-    )
-
-    def worker():
-        total = int(len(accounts))
-        done = 0
-        success = 0
-        limited = 0
-        skipped_inactive = 0
-        skipped_no_auth = 0
-        failed = 0
-        fail_by_code: dict[str, int] = {}
-        for item in accounts:
-            done += 1
-            if not bool(item.get("enabled")) or str(item.get("status") or "") != AccountStatus.ACTIVE.value:
-                skipped_inactive += 1
-                continue
-            if not (item.get("epic_account_id") and item.get("device_id") and item.get("device_secret")):
-                skipped_no_auth += 1
-                continue
-
-            proxy_url = db_exec(lambda db: get_proxy_for_account(db, int(item["id"])))
-            result = set_profile_privacy_with_device(
-                login=str(item["login"]),
-                password=str(item["password"]),
-                privacy_level=level,
-                proxy_url=proxy_url,
-                epic_account_id=str(item["epic_account_id"] or ""),
-                device_id=str(item["device_id"] or ""),
-                device_secret=str(item["device_secret"] or ""),
-                namespace="Fortnite",
-            )
-            if result.ok:
-                success += 1
-                if str(result.code or "") == "privacy_settings_updated_limited":
-                    limited += 1
-            else:
-                failed += 1
-                code = str(result.code or "unknown_error")
-                fail_by_code[code] = int(fail_by_code.get(code, 0) or 0) + 1
-
-            if done % 20 == 0 or done == total:
-                show_menu_status(
-                    chat_id,
-                    "accounts",
-                    f"⏳ Приватность профиля ({label}): {done}/{total}\n"
-                    f"Успешно: {success}, ошибок: {failed}",
-                )
-
-        lines = [
-            f"✅ Массовая смена приватности завершена ({label}).",
-            f"Проверено: {total}",
-            f"Успешно: {success}",
-            f"Из них с ограничением API (режим «Только друзья» -> «Закрытый»): {limited}",
-            f"Пропущено (неактивные): {skipped_inactive}",
-            f"Пропущено (без device_auth): {skipped_no_auth}",
-            f"Ошибок: {failed}",
-        ]
-        if missing:
-            lines.append(f"Не найдены селекторы: {len(missing)}")
-            lines.extend([f"- {x}" for x in missing[:10]])
-        if fail_by_code:
-            lines.append("Ошибки по кодам:")
-            for code, cnt in sorted(fail_by_code.items(), key=lambda x: (-x[1], x[0])):
-                lines.append(f"- {code}: {cnt}")
-        show_menu_status(chat_id, "accounts", "\n".join(lines))
-
-    threading.Thread(target=worker, daemon=True).start()
 
 
 def handle_add_target_single(message):
