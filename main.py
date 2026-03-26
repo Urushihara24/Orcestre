@@ -4873,6 +4873,31 @@ def show_campaign_progress(chat_id: int, with_campaign_info: bool = False):
             .scalar()
             or 0
         )
+        target_ids = [int(tid) for tid, _, _ in targets]
+        shared_senders_today = 0
+        if target_ids:
+            per_sender_today = (
+                db.query(
+                    Task.account_id.label("account_id"),
+                    func.count(func.distinct(Task.target_id)).label("targets_done"),
+                )
+                .filter(
+                    task_campaign_filter(db, selected_campaign_id),
+                    Task.task_type == "send_request",
+                    Task.status == TaskStatus.DONE.value,
+                    Task.completed_at >= day_start,
+                    Task.completed_at < day_end,
+                )
+                .group_by(Task.account_id)
+                .subquery()
+            )
+            shared_senders_today = int(
+                db.query(func.count())
+                .select_from(per_sender_today)
+                .filter(per_sender_today.c.targets_done >= int(len(target_ids)))
+                .scalar()
+                or 0
+            )
         send_queue = (
             db.query(func.count(Task.id))
             .filter(
@@ -4996,6 +5021,7 @@ def show_campaign_progress(chat_id: int, with_campaign_info: bool = False):
             int(total_send_done_last_30m),
             int(senders_total),
             int(senders_today),
+            int(shared_senders_today),
             int(send_queue),
             int(check_queue),
             int(accepted_today),
@@ -5031,6 +5057,7 @@ def show_campaign_progress(chat_id: int, with_campaign_info: bool = False):
         total_send_done_last_30m,
         senders_total,
         senders_today,
+        shared_senders_today,
         send_queue,
         check_queue,
         accepted_today,
@@ -5109,6 +5136,7 @@ def show_campaign_progress(chat_id: int, with_campaign_info: bool = False):
         f"• Новых заявок отправлено сегодня (DONE send_request): {total_send_done_today}",
         f"• Активность сейчас: за 10 мин = {total_send_done_last_10m}, за 30 мин = {total_send_done_last_30m}",
         f"• Уникальных аккаунтов-отправителей сегодня (сделали >=1 DONE): {senders_today}",
+        f"• Общих аккаунтов на все ники сегодня (DONE по каждому нику): {shared_senders_today}",
         f"• Новых заявок отправлено всего: {total_send_done}",
         "",
         "Очередь и проверка:",
