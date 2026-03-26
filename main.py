@@ -1711,6 +1711,28 @@ def create_tasks_for_new_targets(db, limit: int = 500, campaign_id: Optional[int
         target_statuses = list(TARGET_SEND_BASE_STATUSES)
 
     day_start_utc, day_end_utc = local_day_bounds_utc_naive(db, now)
+    # Strict sender-rotation rule for new sends:
+    # if sender already produced DONE send_request in this campaign today,
+    # do not schedule new primary sends from it again (recheck is separate flow).
+    used_new_senders_today: set[int] = set()
+    if campaign_id is not None:
+        used_rows = (
+            db.query(Task.account_id)
+            .filter(
+                Task.task_type == "send_request",
+                Task.status == TaskStatus.DONE.value,
+                Task.campaign_id == int(campaign_id),
+                Task.completed_at >= day_start_utc,
+                Task.completed_at < day_end_utc,
+                or_(
+                    Task.last_error.is_(None),
+                    ~Task.last_error.in_(["recheck_resend", "manual_forced_cycle"]),
+                ),
+            )
+            .distinct()
+            .all()
+        )
+        used_new_senders_today = {int(x[0]) for x in used_rows if x and x[0] is not None}
 
     targets = db.query(Target).filter(
         campaign_filter,
@@ -1814,6 +1836,8 @@ def create_tasks_for_new_targets(db, limit: int = 500, campaign_id: Optional[int
         t = state["target"]
         assigned_accounts = state["assigned"]
         skipped_accounts = state["skipped"]
+        if campaign_id_for_tasks is not None and int(acc.id) in used_new_senders_today:
+            return False
         if int(acc.id) in skipped_accounts:
             return False
         if int(acc.id) in assigned_accounts or int(state["missing"]) <= 0:
