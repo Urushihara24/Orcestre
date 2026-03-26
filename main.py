@@ -109,7 +109,7 @@ DEFAULT_MAX_REQUEST_INTERVAL_SEC = int(os.getenv("DEFAULT_MAX_REQUEST_INTERVAL_S
 DEFAULT_HOURLY_API_LIMIT = int(os.getenv("DEFAULT_HOURLY_API_LIMIT", "40"))
 DEFAULT_DAILY_API_LIMIT = int(os.getenv("DEFAULT_DAILY_API_LIMIT", "500"))
 DEFAULT_SEND_API_COST = int(os.getenv("DEFAULT_SEND_API_COST", "3"))
-DEFAULT_CHECK_API_COST = int(os.getenv("DEFAULT_CHECK_API_COST", "2"))
+DEFAULT_CHECK_API_COST = int(os.getenv("DEFAULT_CHECK_API_COST", "0"))
 DEFAULT_RECHECK_DAILY_LIMIT = int(os.getenv("DEFAULT_RECHECK_DAILY_LIMIT", "500"))
 DEFAULT_DAILY_REPEAT_CAMPAIGN_ENABLED = os.getenv("DAILY_REPEAT_CAMPAIGN_ENABLED", "0").strip().lower() in {"1", "true", "yes"}
 RUNNING_TASK_STALE_SEC = max(60, int(os.getenv("RUNNING_TASK_STALE_SEC", "900")))
@@ -513,6 +513,12 @@ def ensure_runtime_settings() -> None:
         if tz_obj:
             tz_obj.value = DEFAULT_TIMEZONE
             tz_obj.updated_at = utc_now()
+        # Legacy migration: old default check_api_cost=2 consumed quota with status checks.
+        # New default is 0 so checks run in background and don't block new sends.
+        check_cost_obj = db.query(Setting).filter(Setting.key == "check_api_cost").first()
+        if check_cost_obj and str(check_cost_obj.value or "").strip() == "2":
+            check_cost_obj.value = "0"
+            check_cost_obj.updated_at = utc_now()
         db.commit()
 
     db_exec(_inner)
@@ -2644,13 +2650,14 @@ def process_tasks_job():
                     continue
 
                 if not DRY_RUN:
-                    check_api_cost = max(1, get_setting_int(db, "check_api_cost", DEFAULT_CHECK_API_COST))
-                    ok_rate, next_at, reason = enforce_api_rate_limit(db, acc, now, check_api_cost)
-                    if not ok_rate:
-                        task.status = TaskStatus.POSTPONED.value
-                        task.last_error = f"api_rate_limit_{reason}"
-                        task.scheduled_for = next_at or (now + timedelta(seconds=60))
-                        continue
+                    check_api_cost = max(0, get_setting_int(db, "check_api_cost", DEFAULT_CHECK_API_COST))
+                    if check_api_cost > 0:
+                        ok_rate, next_at, reason = enforce_api_rate_limit(db, acc, now, check_api_cost)
+                        if not ok_rate:
+                            task.status = TaskStatus.POSTPONED.value
+                            task.last_error = f"api_rate_limit_{reason}"
+                            task.scheduled_for = next_at or (now + timedelta(seconds=60))
+                            continue
 
                 task.status = TaskStatus.RUNNING.value
                 task.started_at = now
