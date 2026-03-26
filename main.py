@@ -2454,39 +2454,14 @@ def process_tasks_job():
                     task.status = TaskStatus.CANCELLED.value
                     task.completed_at = now
                     task.last_error = "precheck_accepted_skip"
-                    # Already friends: this sender must not count as new coverage.
-                    # Try to replace by another eligible sender.
-                    done_sender_ids = _done_sender_ids_for_target(db, int(tgt.id), camp, now)
-                    replaced = False
-                    if len(done_sender_ids) < int(req):
-                        replaced = _enqueue_replacement_send_task(
-                            db,
-                            target=tgt,
-                            camp=camp,
-                            now=now,
-                            excluded_ids={int(acc.id)},
-                            source_reason="replacement_after_precheck_accepted",
-                        )
-                    task.last_error = "precheck_accepted_skip_requeued" if replaced else "precheck_accepted_skip"
+                    # Keep replacement deterministic: planner will select next sender.
                     processed += 1
                     continue
 
                 if pre_status.ok and pre_status.code == "pending":
                     task.status = TaskStatus.CANCELLED.value
                     task.completed_at = now
-                    # Request is already pending for this sender: skip from coverage and replace sender.
-                    done_sender_ids = _done_sender_ids_for_target(db, int(tgt.id), camp, now)
-                    replaced = False
-                    if len(done_sender_ids) < int(req):
-                        replaced = _enqueue_replacement_send_task(
-                            db,
-                            target=tgt,
-                            camp=camp,
-                            now=now,
-                            excluded_ids={int(acc.id)},
-                            source_reason="replacement_after_precheck_pending",
-                        )
-                    task.last_error = "precheck_pending_skip_requeued" if replaced else "precheck_pending_skip"
+                    task.last_error = "precheck_pending_skip"
                     processed += 1
                     continue
 
@@ -2505,25 +2480,11 @@ def process_tasks_job():
                     was_idempotent = bool(result_data.get("note") == "idempotent_success")
                     if was_idempotent:
                         # Epic returned idempotent success (already friends / already pending).
-                        # Do not count this as a new send for coverage; replace sender if needed.
+                        # Do not count this as a new send for coverage.
+                        # No immediate replacement here: planner handles next sender.
                         task.status = TaskStatus.CANCELLED.value
                         task.completed_at = now
-                        req = target_required_senders(db, tgt)
-                        replaced = False
-                        if not is_recheck_resend:
-                            done_sender_ids = _done_sender_ids_for_target(db, int(tgt.id), camp, now)
-                            if len(done_sender_ids) < int(req):
-                                replaced = _enqueue_replacement_send_task(
-                                    db,
-                                    target=tgt,
-                                    camp=camp,
-                                    now=now,
-                                    excluded_ids={int(acc.id)},
-                                    source_reason="replacement_after_idempotent_send",
-                                )
-                        task.last_error = (
-                            "idempotent_request_skip_requeued" if replaced else "idempotent_request_skip"
-                        )
+                        task.last_error = "idempotent_request_skip"
                         acc.last_activity_at = now
                         acc.last_error = None
                     else:
