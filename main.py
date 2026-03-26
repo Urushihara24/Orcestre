@@ -1912,7 +1912,11 @@ def create_tasks_for_new_targets(db, limit: int = 500, campaign_id: Optional[int
             # Gap between sender layers should depend on how many sender layers
             # are required for current goal coverage, not on raw task capacity.
             estimated_sender_layers = max(1, max(int(st["missing"]) for st in target_states))
-            auto_switch_gap_sec = max(1, total_window_sec // estimated_sender_layers)
+            per_layer_budget_sec = max(1, total_window_sec // estimated_sender_layers)
+            # One layer already includes sequential sends to all nicks with jitter.
+            # Extra pause is only the remaining budget after this sender block.
+            sender_block_estimate_sec = max(1, int(targets_in_cycle) * int(avg_jitter_sec))
+            auto_switch_gap_sec = max(0, int(per_layer_budget_sec) - int(sender_block_estimate_sec))
             if switch_max_sec > 0:
                 auto_switch_gap_sec = max(auto_switch_gap_sec, switch_min_sec)
                 auto_switch_gap_sec = min(auto_switch_gap_sec, switch_max_sec)
@@ -1974,10 +1978,9 @@ def create_tasks_for_new_targets(db, limit: int = 500, campaign_id: Optional[int
                 sender_timeline_offset_sec = int(elapsed_now_sec)
                 # Ensure sender blocks never overlap, even if switch gap is clamped
                 # by user settings: one sender completes its nick block first.
-                sender_block_stride_sec = max(
-                    1,
-                    int(targets_in_cycle) * max(1, int(max_s)) + int(auto_switch_gap_sec),
-                )
+                # Use layer budget directly. Previous formula double-counted sender block
+                # and over-delayed next sender start under large nick lists.
+                sender_block_stride_sec = max(1, int(per_layer_budget_sec))
                 for shift, acc in enumerate(ordered_accs):
                     if all(int(st["missing"]) <= 0 for st in target_states):
                         break
@@ -5106,7 +5109,7 @@ def show_campaign_progress(chat_id: int, with_campaign_info: bool = False):
         "",
         "Новые отправки:",
         f"• Новых заявок отправлено сегодня (DONE send_request): {total_send_done_today}",
-        f"• Уникальных аккаунтов отправителей сегодня: {senders_today}",
+        f"• Уникальных аккаунтов-отправителей сегодня (сделали >=1 DONE): {senders_today}",
         f"• Новых заявок отправлено всего: {total_send_done}",
         "",
         "Очередь и проверка:",
