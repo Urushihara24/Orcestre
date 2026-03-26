@@ -622,9 +622,20 @@ class EpicGamesAPIClient:
 
         def _impl(access_token: str, account_id: str) -> ProviderResult:
             url = f"{self.ACCOUNT_BASE}/account/api/public/account/{quote(account_id, safe='')}"
-            headers = {"Authorization": f"Bearer {access_token}"}
+            headers = {
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+            }
             payload = {"displayName": nickname}
-            success, resp_data, error_code = self._make_request("PUT", url, headers=headers, data=payload)
+
+            # важно: json=payload вместо data=payload
+            success, resp_data, error_code = self._make_request(
+                "PUT",
+                url,
+                headers=headers,
+                json=payload,
+            )
 
             if success:
                 applied_name = ""
@@ -646,16 +657,16 @@ class EpicGamesAPIClient:
             msg = ""
             if isinstance(resp_data, dict):
                 msg = (
-                    str(resp_data.get("errorMessage") or "")
-                    or str(resp_data.get("error_description") or "")
-                    or str(resp_data.get("error") or "")
+                        str(resp_data.get("errorMessage") or "")
+                        or str(resp_data.get("error_description") or "")
+                        or str(resp_data.get("error") or "")
                 )
             low_msg = msg.lower()
 
             if (
-                "display" in details and "already" in details
-                or "already in use" in low_msg
-                or "already used" in low_msg
+                    "display" in details and "already" in details
+                    or "already in use" in low_msg
+                    or "already used" in low_msg
             ):
                 return ProviderResult(False, "nickname_taken", msg or "Display name is already used")
             if "display" in details and ("cooldown" in details or "change" in details and "14" in details):
@@ -663,9 +674,9 @@ class EpicGamesAPIClient:
             if "can only be changed" in low_msg or "14 day" in low_msg or "two weeks" in low_msg:
                 return ProviderResult(False, "nickname_cooldown", msg or "Display name can not be changed yet")
             if (
-                "invalid" in low_msg
-                or "not allowed" in low_msg
-                or "display" in details and "invalid" in details
+                    "invalid" in low_msg
+                    or "not allowed" in low_msg
+                    or "display" in details and "invalid" in details
             ):
                 return ProviderResult(False, "invalid_nickname", msg or "Invalid display name")
 
