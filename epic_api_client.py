@@ -730,8 +730,8 @@ class EpicGamesAPIClient:
 
     def set_profile_privacy_level(self, level: str, namespace: str = "Fortnite") -> ProviderResult:
         """
-        Массово выставить уровень приватности для ключей profile privacy:
-        playRegion, languages, badges.
+        Настроить режим входящих заявок в друзья через friends settings:
+        acceptInvites = public/private.
         """
         lvl = str(level or "").strip().upper()
         if lvl not in {"PUBLIC", "FRIENDS_ONLY", "PRIVATE"}:
