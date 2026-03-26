@@ -4857,6 +4857,28 @@ def show_campaign_progress(chat_id: int, with_campaign_info: bool = False):
             .scalar()
             or 0
         )
+        total_send_done_last_10m = (
+            db.query(func.count(Task.id))
+            .filter(
+                task_campaign_filter(db, selected_campaign_id),
+                Task.task_type == "send_request",
+                Task.status == TaskStatus.DONE.value,
+                Task.completed_at >= (now - timedelta(minutes=10)),
+            )
+            .scalar()
+            or 0
+        )
+        total_send_done_last_30m = (
+            db.query(func.count(Task.id))
+            .filter(
+                task_campaign_filter(db, selected_campaign_id),
+                Task.task_type == "send_request",
+                Task.status == TaskStatus.DONE.value,
+                Task.completed_at >= (now - timedelta(minutes=30)),
+            )
+            .scalar()
+            or 0
+        )
         senders_total = (
             db.query(func.count(func.distinct(Task.account_id)))
             .filter(
@@ -4998,6 +5020,8 @@ def show_campaign_progress(chat_id: int, with_campaign_info: bool = False):
             senders_map,
             int(total_send_done),
             int(total_send_done_today),
+            int(total_send_done_last_10m),
+            int(total_send_done_last_30m),
             int(senders_total),
             int(senders_today),
             int(send_queue),
@@ -5031,6 +5055,8 @@ def show_campaign_progress(chat_id: int, with_campaign_info: bool = False):
         senders_map,
         total_send_done,
         total_send_done_today,
+        total_send_done_last_10m,
+        total_send_done_last_30m,
         senders_total,
         senders_today,
         send_queue,
@@ -5109,6 +5135,7 @@ def show_campaign_progress(chat_id: int, with_campaign_info: bool = False):
         "",
         "Новые отправки:",
         f"• Новых заявок отправлено сегодня (DONE send_request): {total_send_done_today}",
+        f"• Активность сейчас: за 10 мин = {total_send_done_last_10m}, за 30 мин = {total_send_done_last_30m}",
         f"• Уникальных аккаунтов-отправителей сегодня (сделали >=1 DONE): {senders_today}",
         f"• Новых заявок отправлено всего: {total_send_done}",
         "",
