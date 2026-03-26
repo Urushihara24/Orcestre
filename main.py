@@ -2851,39 +2851,85 @@ def process_nickname_change_tasks_job():
 
     def _inner(db):
         if not get_setting_bool(db, "processing_enabled", True):
-            return 0
+            return {
+                "processed": 0,
+                "done": 0,
+                "failed": 0,
+                "postponed": 0,
+                "skipped": 0,
+            }
+
         now = utc_now()
-        processed = 0
+
+        stats = {
+            "processed": 0,
+            "done": 0,
+            "failed": 0,
+            "postponed": 0,
+            "skipped": 0,
+        }
+
         q = db.query(NicknameChangeTask).filter(
             NicknameChangeTask.status.in_([
                 NicknameChangeStatus.QUEUED.value,
                 NicknameChangeStatus.POSTPONED.value,
             ]),
             NicknameChangeTask.scheduled_for <= now,
-        ).order_by(NicknameChangeTask.scheduled_for.asc(), NicknameChangeTask.id.asc())
+        ).order_by(
+            NicknameChangeTask.scheduled_for.asc(),
+            NicknameChangeTask.id.asc(),
+        )
+
         if DB_URL.startswith("postgresql"):
             q = q.with_for_update(skip_locked=True)
+
         jobs = q.limit(max(1, min(20, MAX_TASKS_PER_TICK))).all()
 
         for job in jobs:
             acc = db.query(Account).filter(Account.id == int(job.account_id)).first()
+
             if not acc:
                 job.status = NicknameChangeStatus.FAILED.value
                 job.last_error = "account_missing"
                 job.completed_at = now
-                processed += 1
+                stats["processed"] += 1
+                stats["failed"] += 1
+                logger.warning(
+                    "[NICKNAME_FAIL] job_id=%s account_id=%s reason=account_missing",
+                    job.id,
+                    job.account_id,
+                )
                 continue
+
             if not acc.enabled or acc.status != AccountStatus.ACTIVE.value:
                 job.status = NicknameChangeStatus.POSTPONED.value
                 job.last_error = "account_not_active"
                 job.scheduled_for = now + timedelta(minutes=30)
-                processed += 1
+                stats["processed"] += 1
+                stats["postponed"] += 1
+                logger.info(
+                    "[NICKNAME_POSTPONED] job_id=%s account_id=%s login=%s requested_nick=%s reason=account_not_active next_at=%s",
+                    job.id,
+                    acc.id,
+                    acc.login,
+                    job.requested_nick,
+                    job.scheduled_for,
+                )
                 continue
+
             if not (acc.epic_account_id and acc.device_id and acc.device_secret):
                 job.status = NicknameChangeStatus.FAILED.value
                 job.last_error = "missing_device_auth"
                 job.completed_at = now
-                processed += 1
+                stats["processed"] += 1
+                stats["failed"] += 1
+                logger.warning(
+                    "[NICKNAME_FAIL] job_id=%s account_id=%s login=%s requested_nick=%s reason=missing_device_auth",
+                    job.id,
+                    acc.id,
+                    acc.login,
+                    job.requested_nick,
+                )
                 continue
 
             ok_nick, nick_reason = validate_requested_nickname(job.requested_nick)
@@ -2891,7 +2937,16 @@ def process_nickname_change_tasks_job():
                 job.status = NicknameChangeStatus.FAILED.value
                 job.last_error = f"invalid_nickname_format: {nick_reason}"
                 job.completed_at = now
-                processed += 1
+                stats["processed"] += 1
+                stats["failed"] += 1
+                logger.warning(
+                    "[NICKNAME_FAIL] job_id=%s account_id=%s login=%s requested_nick=%s reason=invalid_nickname_format details=%s",
+                    job.id,
+                    acc.id,
+                    acc.login,
+                    job.requested_nick,
+                    nick_reason,
+                )
                 continue
 
             if not DRY_RUN:
@@ -2901,101 +2956,233 @@ def process_nickname_change_tasks_job():
                     job.status = NicknameChangeStatus.POSTPONED.value
                     job.last_error = f"api_rate_limit_{reason}"
                     job.scheduled_for = next_at or (now + timedelta(seconds=60))
-                    processed += 1
+                    stats["processed"] += 1
+                    stats["postponed"] += 1
+                    logger.info(
+                        "[NICKNAME_POSTPONED] job_id=%s account_id=%s login=%s requested_nick=%s reason=api_rate_limit_%s next_at=%s",
+                        job.id,
+                        acc.id,
+                        acc.login,
+                        job.requested_nick,
+                        reason,
+                        job.scheduled_for,
+                    )
                     continue
 
             job.status = NicknameChangeStatus.RUNNING.value
             job.started_at = now
             db.commit()
 
+            logger.info(
+                "[NICKNAME_START] job_id=%s account_id=%s login=%s current_nick=%s requested_nick=%s attempt=%s/%s",
+                job.id,
+                acc.id,
+                acc.login,
+                acc.epic_display_name,
+                job.requested_nick,
+                int(job.attempt_number or 0) + 1,
+                int(job.max_attempts or 3),
+            )
+
             try:
                 if DRY_RUN:
-                    acc.epic_display_name = str(job.requested_nick)
+                    final_nick = str(job.requested_nick)
+                    acc.epic_display_name = final_nick
                     acc.last_activity_at = now
                     acc.last_error = None
-                    job.final_nick = str(job.requested_nick)
+
+                    job.final_nick = final_nick
                     job.status = NicknameChangeStatus.DONE.value
                     job.completed_at = now
-                    processed += 1
+                    job.last_error = None
+
+                    stats["processed"] += 1
+                    stats["done"] += 1
+
+                    logger.info(
+                        "[NICKNAME_SUCCESS] job_id=%s account_id=%s login=%s requested_nick=%s final_nick=%s dry_run=1",
+                        job.id,
+                        acc.id,
+                        acc.login,
+                        job.requested_nick,
+                        final_nick,
+                    )
                     continue
 
                 proxy_url = get_proxy_for_account(db, int(acc.id))
+                requested_nick_before_call = str(job.requested_nick)
+
                 result = change_display_name_with_device(
                     login=acc.login,
                     password=acc.password,
-                    new_display_name=str(job.requested_nick),
+                    new_display_name=requested_nick_before_call,
                     proxy_url=proxy_url,
                     epic_account_id=acc.epic_account_id,
                     device_id=acc.device_id,
                     device_secret=acc.device_secret,
                 )
+
                 if result.ok:
-                    applied = str(((result.data or {}).get("display_name") if result.data else "") or "").strip()
-                    final_nick = applied or str(job.requested_nick)
+                    applied = str(
+                        ((result.data or {}).get("display_name") if result.data else "") or ""
+                    ).strip()
+                    final_nick = applied or requested_nick_before_call
+
                     acc.epic_display_name = final_nick
                     acc.last_activity_at = now
                     acc.last_error = None
+
                     job.final_nick = final_nick
                     job.status = NicknameChangeStatus.DONE.value
                     job.completed_at = now
                     job.last_error = None
+
+                    stats["processed"] += 1
+                    stats["done"] += 1
+
+                    logger.info(
+                        "[NICKNAME_SUCCESS] job_id=%s account_id=%s login=%s requested_nick=%s final_nick=%s",
+                        job.id,
+                        acc.id,
+                        acc.login,
+                        requested_nick_before_call,
+                        final_nick,
+                    )
                 else:
                     job.attempt_number = int(job.attempt_number or 0) + 1
                     err = f"{result.code}: {result.message}"
                     job.last_error = err[:500]
                     acc.last_error = err[:500]
+
+                    logger.warning(
+                        "[NICKNAME_FAIL] job_id=%s account_id=%s login=%s requested_nick=%s code=%s message=%s attempt=%s/%s",
+                        job.id,
+                        acc.id,
+                        acc.login,
+                        requested_nick_before_call,
+                        result.code,
+                        result.message,
+                        int(job.attempt_number or 0),
+                        int(job.max_attempts or 3),
+                    )
+
                     if result.code == "rate_limited":
                         job.status = NicknameChangeStatus.POSTPONED.value
                         job.scheduled_for = now + timedelta(minutes=30)
+                        stats["postponed"] += 1
+                        logger.info(
+                            "[NICKNAME_POSTPONED] job_id=%s account_id=%s login=%s requested_nick=%s reason=rate_limited next_at=%s",
+                            job.id,
+                            acc.id,
+                            acc.login,
+                            requested_nick_before_call,
+                            job.scheduled_for,
+                        )
+
                     elif result.code == "nickname_taken":
-                        variants = _nickname_fallback_candidates(str(job.requested_nick))
+                        variants = _nickname_fallback_candidates(requested_nick_before_call)
                         next_nick = variants[0] if variants else ""
+
                         if next_nick and int(job.attempt_number or 0) < int(job.max_attempts or 3):
+                            logger.info(
+                                "[NICKNAME_RETRY] job_id=%s account_id=%s login=%s taken_nick=%s fallback_nick=%s attempt=%s/%s",
+                                job.id,
+                                acc.id,
+                                acc.login,
+                                requested_nick_before_call,
+                                next_nick,
+                                int(job.attempt_number or 0),
+                                int(job.max_attempts or 3),
+                            )
                             job.requested_nick = next_nick
                             job.status = NicknameChangeStatus.POSTPONED.value
                             job.scheduled_for = now + timedelta(minutes=5)
                             job.last_error = f"nickname_taken_retry:{next_nick}"
+                            stats["postponed"] += 1
                         else:
                             job.status = NicknameChangeStatus.FAILED.value
                             job.completed_at = now
+                            stats["failed"] += 1
+
                     elif result.code in {"nickname_cooldown", "invalid_nickname"}:
                         job.status = NicknameChangeStatus.FAILED.value
                         job.completed_at = now
+                        stats["failed"] += 1
+
                     elif result.code == "password_grant_blocked":
                         acc.status = AccountStatus.MANUAL.value
                         acc.last_error = "password_grant_blocked_use_device_auth"
                         job.status = NicknameChangeStatus.FAILED.value
                         job.completed_at = now
+                        stats["failed"] += 1
+
                     elif result.code == "auth_failed" or "auth" in str(result.code or "").lower():
                         acc.status = AccountStatus.MANUAL.value
                         job.status = NicknameChangeStatus.FAILED.value
                         job.completed_at = now
+                        stats["failed"] += 1
+
                     elif int(job.attempt_number or 0) < int(job.max_attempts or 3):
                         job.status = NicknameChangeStatus.POSTPONED.value
-                        job.scheduled_for = now + timedelta(minutes=10 * int(job.attempt_number or 1))
+                        job.scheduled_for = now + timedelta(
+                            minutes=10 * int(job.attempt_number or 1)
+                        )
+                        stats["postponed"] += 1
+                        logger.info(
+                            "[NICKNAME_POSTPONED] job_id=%s account_id=%s login=%s requested_nick=%s reason=retry_backoff next_at=%s",
+                            job.id,
+                            acc.id,
+                            acc.login,
+                            requested_nick_before_call,
+                            job.scheduled_for,
+                        )
                     else:
                         job.status = NicknameChangeStatus.FAILED.value
                         job.completed_at = now
-                processed += 1
+                        stats["failed"] += 1
+
+                    stats["processed"] += 1
+
             except Exception as e:
                 job.attempt_number = int(job.attempt_number or 0) + 1
                 job.last_error = f"exception: {str(e)[:300]}"
+
+                logger.exception(
+                    "[NICKNAME_EXCEPTION] job_id=%s account_id=%s login=%s requested_nick=%s",
+                    job.id,
+                    acc.id if acc else None,
+                    acc.login if acc else None,
+                    job.requested_nick,
+                )
+
                 if int(job.attempt_number or 0) < int(job.max_attempts or 3):
                     job.status = NicknameChangeStatus.POSTPONED.value
                     job.scheduled_for = now + timedelta(minutes=10)
+                    stats["postponed"] += 1
                 else:
                     job.status = NicknameChangeStatus.FAILED.value
                     job.completed_at = now
-                processed += 1
+                    stats["failed"] += 1
+
+                stats["processed"] += 1
 
         db.commit()
-        return int(processed)
+        return stats
 
-    processed = db_exec(_inner)
-    if processed > 0:
-        log_event("info", f"📝 Обработано задач смены ников: {processed}")
-    return int(processed or 0)
+    stats = db_exec(_inner)
 
+    if int(stats.get("processed", 0)) > 0:
+        log_event(
+            "info",
+            "📝 Смена ников: "
+            f"processed={int(stats.get('processed', 0))}, "
+            f"done={int(stats.get('done', 0))}, "
+            f"failed={int(stats.get('failed', 0))}, "
+            f"postponed={int(stats.get('postponed', 0))}, "
+            f"skipped={int(stats.get('skipped', 0))}",
+        )
+
+    return int(stats.get("processed", 0) or 0)
 
 # ============================================================
 # TELEGRAM UI (anti-spam)
