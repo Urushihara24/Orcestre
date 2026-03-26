@@ -859,6 +859,21 @@ def _campaign_effective_daily_limit(db, camp: Campaign, now_utc: datetime) -> in
     return max(1, int(stored_val))
 
 
+def _campaign_sender_daily_cap(db, camp: Campaign, now_utc: datetime) -> int:
+    """
+    Effective daily cap for one sender in a campaign.
+    UX rule: one sender should be able to cover full nick list of the campaign.
+    """
+    base_limit = _campaign_effective_daily_limit(db, camp, now_utc)
+    targets_total = int(
+        db.query(func.count(Target.id))
+        .filter(target_campaign_filter(db, int(camp.id)))
+        .scalar()
+        or 0
+    )
+    return max(1, int(base_limit), int(targets_total))
+
+
 def _campaign_pacing_gate(db, camp: Campaign, now_utc: datetime) -> tuple[bool, Optional[datetime], str]:
     """
     Global campaign pacing: spread today's planned send tasks across campaign window.
@@ -1554,7 +1569,7 @@ def _pick_replacement_account_for_target(
     blocked_ids = set(int(x) for x in excluded_ids) | set(done_sender_ids)
 
     if camp is not None:
-        campaign_daily_limit = _campaign_effective_daily_limit(db, camp, now)
+        campaign_daily_limit = _campaign_sender_daily_cap(db, camp, now)
         try:
             camp_windows = json.loads(camp.active_windows_json or "[]")
         except Exception:
@@ -1733,7 +1748,7 @@ def create_tasks_for_new_targets(db, limit: int = 500, campaign_id: Optional[int
         min_s = max(0, int((camp_for_cfg.jitter_min_sec if camp_for_cfg else DEFAULT_SEND_JITTER_MIN_SEC) or DEFAULT_SEND_JITTER_MIN_SEC))
         max_s = max(min_s, int((camp_for_cfg.jitter_max_sec if camp_for_cfg else DEFAULT_SEND_JITTER_MAX_SEC) or DEFAULT_SEND_JITTER_MAX_SEC))
         if camp_for_cfg:
-            default_daily_limit_per_account = _campaign_effective_daily_limit(db, camp_for_cfg, now)
+            default_daily_limit_per_account = _campaign_sender_daily_cap(db, camp_for_cfg, now)
         else:
             default_daily_limit_per_account = max(1, int(DEFAULT_DAILY_LIMIT))
         default_windows_json = (camp_for_cfg.active_windows_json if camp_for_cfg else "[]") or "[]"
@@ -2326,7 +2341,7 @@ def process_tasks_job():
                         continue
 
                 if camp is not None:
-                    campaign_daily_limit = _campaign_effective_daily_limit(db, camp, now)
+                    campaign_daily_limit = _campaign_sender_daily_cap(db, camp, now)
                     campaign_today_sent = campaign_sent_today_for_account(db, acc.id, int(camp.id), now)
                 else:
                     campaign_daily_limit = max(1, int(acc.daily_limit or DEFAULT_DAILY_LIMIT))
@@ -3640,7 +3655,7 @@ INLINE_ACTION_TEXT = {
     "acc_device": "🔐 Авторизация Epic (ссылка)",
     "acc_check": "✅ Проверить аккаунты",
     "acc_refresh_names": "🔄 Обновить ники Epic",
-    "acc_privacy_bulk": "🔒 Конфиденциальность профиля",
+    "acc_privacy_bulk": "📩 Режим входящих заявок",
     "acc_nick_change_import": "📝 Массовая смена ников",
     "acc_nick_change_status": "📊 Статус смены ников",
     "acc_add": "➕ Добавить аккаунт",
@@ -3770,7 +3785,7 @@ def kb_accounts_list_reply(accounts: list[Account]) -> types.InlineKeyboardMarku
         short = sender_label if len(sender_label) <= 26 else sender_label[:25] + "…"
         m.add(
             types.InlineKeyboardButton(
-                f"🔒 {short}",
+                f"📩 {short}",
                 callback_data=f"acc_pick_priv:{int(acc.id)}",
             )
         )
@@ -3784,19 +3799,13 @@ def kb_account_privacy_one_reply(account_id: int) -> types.InlineKeyboardMarkup:
     m = types.InlineKeyboardMarkup(row_width=2)
     m.add(
         types.InlineKeyboardButton(
-            "🌐 Открытый",
+            "🌐 Принимать от всех",
             callback_data=f"acc_set_priv:{int(account_id)}:{PROFILE_PRIVACY_LEVEL_PUBLIC}",
         ),
         types.InlineKeyboardButton(
-            "🔒 Закрытый",
+            "🔒 Не принимать",
             callback_data=f"acc_set_priv:{int(account_id)}:{PROFILE_PRIVACY_LEVEL_PRIVATE}",
         ),
-    )
-    m.add(
-        types.InlineKeyboardButton(
-            "👥 Только друзья",
-            callback_data=f"acc_set_priv:{int(account_id)}:{PROFILE_PRIVACY_LEVEL_FRIENDS_ONLY}",
-        )
     )
     m.add(types.InlineKeyboardButton("⬅️ К списку аккаунтов", callback_data="acc_list"))
     return m
@@ -4543,16 +4552,18 @@ def show_account_privacy_menu(chat_id: int, account_id: int, status_note: str = 
         return
 
     lines = [
-        "🔒 Конфиденциальность профиля",
+        "📩 Входящие заявки в друзья (Epic)",
         f"Аккаунт: {row['label']}",
         f"Логин: {row['login']}",
         f"Статус: {'активен' if row['enabled'] and row['status'] == AccountStatus.ACTIVE.value else row['status']}",
         f"Device auth: {'есть' if row['has_da'] else 'нет'}",
         "",
-        "Выбери режим приватности:",
-        "• 🌐 Открытый",
-        "• 🔒 Закрытый",
-        "• 👥 Только друзья",
+        "Настройка влияет только на приём входящих заявок.",
+        "Это НЕ приватность списка друзей/достижений Epic.",
+        "",
+        "Выбери режим:",
+        "• 🌐 Принимать заявки от всех",
+        "• 🔒 Не принимать заявки",
     ]
     if status_note:
         lines.extend(["", status_note])
@@ -5033,11 +5044,12 @@ def show_campaign_progress(chat_id: int, with_campaign_info: bool = False):
         used_ready_count = len(set(ready_account_ids) & used_sender_ids)
         unused_ready_count = max(0, int(ready_count) - int(used_ready_count))
         at_limit_count = 0
+        campaign_sender_cap = 0
         if camp is not None:
-            eff_limit = _campaign_effective_daily_limit(db, camp, now)
+            campaign_sender_cap = _campaign_sender_daily_cap(db, camp, now)
             for a in ready_accounts:
                 sent = campaign_sent_today_for_account(db, int(a.id), int(camp.id), now)
-                if sent >= eff_limit:
+                if sent >= campaign_sender_cap:
                     at_limit_count += 1
             recheck_day_key = f"recheck_counter_day_{int(camp.id)}"
             recheck_val_key = f"recheck_counter_value_{int(camp.id)}"
@@ -5089,6 +5101,7 @@ def show_campaign_progress(chat_id: int, with_campaign_info: bool = False):
             int(used_ready_count),
             int(unused_ready_count),
             int(at_limit_count),
+            int(campaign_sender_cap),
             int(max_required_per_target),
             int(targets_with_sender_deficit),
             int(max_done_per_target),
@@ -5121,6 +5134,7 @@ def show_campaign_progress(chat_id: int, with_campaign_info: bool = False):
         used_ready_count,
         unused_ready_count,
         at_limit_count,
+        campaign_sender_cap,
         max_required_per_target,
         targets_with_sender_deficit,
         max_done_per_target,
@@ -5205,7 +5219,12 @@ def show_campaign_progress(chat_id: int, with_campaign_info: bool = False):
         f"• Отправляли в этой цели (всего уникальных): {senders_total}",
         f"• Уже использовались в цели: {used_ready_count}",
         f"• Ещё не использовались в цели: {unused_ready_count}",
-        f"• Уперлись в дневной лимит API: {at_limit_count}",
+        (
+            f"• Лимит отправок цели на 1 аккаунт/сутки (эфф.): {campaign_sender_cap}"
+            if campaign_id > 0
+            else "• Лимит отправок цели на 1 аккаунт/сутки (эфф.): н/д"
+        ),
+        f"• Уперлись в лимит отправок цели: {at_limit_count}",
         "",
         "Статусы ников:",
         f"🆕 новая={int(status_counts.get(TargetStatus.NEW.value, 0) or 0)}",
@@ -5713,15 +5732,15 @@ def _handle_accounts_actions(message, text: str, chat_id: int) -> bool:
     if text == "📥 Импорт файлов":
         show_menu_status(chat_id, "accounts", "📥 Пришли .xlsx/.txt/.csv файлом в чат.")
         return True
-    if text == "🔒 Конфиденциальность профиля":
+    if text in {"🔒 Конфиденциальность профиля", "📩 Режим входящих заявок"}:
         ask_step(
             message,
-            "Массовая смена конфиденциальности профиля Epic.\n\n"
+            "Массовая настройка входящих заявок в друзья (Epic).\n\n"
+            "Важно: это НЕ приватность списка друзей/достижений Epic.\n\n"
             "Выбери режим:\n"
-            "1 — Открытый\n"
-            "2 — Закрытый\n"
-            "3 — Только друзья\n\n"
-            "Введи: 1 / 2 / 3",
+            "1 — Принимать от всех\n"
+            "2 — Не принимать\n\n"
+            "Введи: 1 / 2",
             handle_mass_privacy_mode,
         )
         return True
