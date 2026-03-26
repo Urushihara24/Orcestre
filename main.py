@@ -1904,6 +1904,7 @@ def create_tasks_for_new_targets(db, limit: int = 500, campaign_id: Optional[int
             intervals = _campaign_daily_intervals_utc(db, default_windows_json, now)
             total_window_sec = _window_total_seconds(intervals)
             elapsed_now_sec = _window_elapsed_seconds(intervals, now)
+            remaining_window_sec = max(1, int(total_window_sec) - int(elapsed_now_sec))
             targets_in_cycle = max(1, sum(1 for st in target_states if int(st["missing"]) > 0))
             # UX rule: one sender should cover the whole nick list in its layer.
             # Keep user limit as baseline, but never lower than number of nicks in current cycle.
@@ -1912,7 +1913,7 @@ def create_tasks_for_new_targets(db, limit: int = 500, campaign_id: Optional[int
             # Gap between sender layers should depend on how many sender layers
             # are required for current goal coverage, not on raw task capacity.
             estimated_sender_layers = max(1, max(int(st["missing"]) for st in target_states))
-            per_layer_budget_sec = max(1, total_window_sec // estimated_sender_layers)
+            per_layer_budget_sec = max(1, remaining_window_sec // estimated_sender_layers)
             # One layer already includes sequential sends to all nicks with jitter.
             # Extra pause is only the remaining budget after this sender block.
             sender_block_estimate_sec = max(1, int(targets_in_cycle) * int(avg_jitter_sec))
@@ -1924,7 +1925,7 @@ def create_tasks_for_new_targets(db, limit: int = 500, campaign_id: Optional[int
             if campaign_send_mode == "target_first":
                 # Target-first mode: nick#1 <- all senders, then nick#2 <- all senders.
                 target_count = max(1, len(target_states))
-                auto_target_gap_sec = max(1, total_window_sec // target_count)
+                auto_target_gap_sec = max(1, remaining_window_sec // target_count)
                 if switch_max_sec > 0:
                     auto_target_gap_sec = max(auto_target_gap_sec, switch_min_sec)
                     auto_target_gap_sec = min(auto_target_gap_sec, switch_max_sec)
@@ -1935,6 +1936,8 @@ def create_tasks_for_new_targets(db, limit: int = 500, campaign_id: Optional[int
                         continue
                     desired_start_offset = max(0, elapsed_now_sec + int(used_target_blocks * auto_target_gap_sec))
                     block_start_offset = max(int(target_timeline_offset_sec), int(desired_start_offset))
+                    if campaign_id_for_tasks is not None and int(block_start_offset) >= int(total_window_sec):
+                        break
                     block_cursor_sec = 0
                     assigned_this_target = 0
                     for shift, acc in enumerate(ordered_accs):
@@ -1951,7 +1954,10 @@ def create_tasks_for_new_targets(db, limit: int = 500, campaign_id: Optional[int
                             continue
                         if int(acc.id) in state["skipped"]:
                             continue
-                        offset = min(max(0, total_window_sec - 1), max(0, block_start_offset + block_cursor_sec))
+                        offset_raw = max(0, int(block_start_offset + block_cursor_sec))
+                        if campaign_id_for_tasks is not None and offset_raw >= int(total_window_sec):
+                            break
+                        offset = min(max(0, total_window_sec - 1), offset_raw)
                         scheduled_seq = _map_offset_to_intervals(intervals, int(offset))
                         if scheduled_seq < now:
                             scheduled_seq = now + timedelta(seconds=1)
@@ -2000,6 +2006,8 @@ def create_tasks_for_new_targets(db, limit: int = 500, campaign_id: Optional[int
                     # Enforce strict layer order: next sender starts only after
                     # previous sender block is fully scheduled.
                     block_start_offset = max(int(sender_timeline_offset_sec), int(desired_start_offset))
+                    if campaign_id_for_tasks is not None and int(block_start_offset) >= int(total_window_sec):
+                        break
                     block_cursor_sec = 0
                     assigned_this_sender = 0
 
@@ -2013,7 +2021,10 @@ def create_tasks_for_new_targets(db, limit: int = 500, campaign_id: Optional[int
                         if int(acc.id) in state["skipped"]:
                             continue
 
-                        offset = min(max(0, total_window_sec - 1), max(0, block_start_offset + block_cursor_sec))
+                        offset_raw = max(0, int(block_start_offset + block_cursor_sec))
+                        if campaign_id_for_tasks is not None and offset_raw >= int(total_window_sec):
+                            break
+                        offset = min(max(0, total_window_sec - 1), offset_raw)
                         scheduled_seq = _map_offset_to_intervals(intervals, int(offset))
                         if scheduled_seq < now:
                             scheduled_seq = now + timedelta(seconds=1)
