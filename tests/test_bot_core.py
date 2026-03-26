@@ -490,7 +490,7 @@ class TestBotCore(unittest.TestCase):
             try:
                 orig = db.query(m.Task).filter(m.Task.id == original_id).first()
                 self.assertEqual(orig.status, m.TaskStatus.CANCELLED.value)
-                self.assertEqual(orig.last_error, "precheck_pending_skip_requeued")
+                self.assertEqual(orig.last_error, "precheck_pending_skip")
 
                 tgt = db.query(m.Target).filter(m.Target.id == tgt_id).first()
                 self.assertEqual(int(tgt.sent_count or 0), 0)
@@ -503,11 +503,10 @@ class TestBotCore(unittest.TestCase):
                         m.Task.target_id == tgt_id,
                         m.Task.account_id == acc2_id,
                         m.Task.status == m.TaskStatus.QUEUED.value,
-                        m.Task.last_error == "replacement_after_precheck_pending",
                     )
                     .first()
                 )
-                self.assertIsNotNone(repl)
+                self.assertIsNone(repl)
             finally:
                 db.close()
         finally:
@@ -597,7 +596,7 @@ class TestBotCore(unittest.TestCase):
             try:
                 orig = db.query(m.Task).filter(m.Task.id == original_id).first()
                 self.assertEqual(orig.status, m.TaskStatus.CANCELLED.value)
-                self.assertEqual(orig.last_error, "idempotent_request_skip_requeued")
+                self.assertEqual(orig.last_error, "idempotent_request_skip")
 
                 tgt = db.query(m.Target).filter(m.Target.id == tgt_id).first()
                 self.assertEqual(int(tgt.sent_count or 0), 0)
@@ -610,11 +609,10 @@ class TestBotCore(unittest.TestCase):
                         m.Task.target_id == tgt_id,
                         m.Task.account_id == acc2_id,
                         m.Task.status == m.TaskStatus.QUEUED.value,
-                        m.Task.last_error == "replacement_after_idempotent_send",
                     )
                     .first()
                 )
-                self.assertIsNotNone(repl)
+                self.assertIsNone(repl)
             finally:
                 db.close()
         finally:
