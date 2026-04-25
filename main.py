@@ -250,6 +250,16 @@ PRECHECK_SKIP_REASONS = (
     "idempotent_request_skip",
     "idempotent_request_skip_requeued",
 )
+PRECHECK_LIFETIME_BLOCK_REASONS = (
+    "precheck_accepted_skip",
+    "precheck_accepted_skip_requeued",
+    "idempotent_request_skip",
+    "idempotent_request_skip_requeued",
+)
+PRECHECK_PENDING_BLOCK_REASONS = (
+    "precheck_pending_skip",
+    "precheck_pending_skip_requeued",
+)
 
 def target_status_ru(code: str) -> str:
     return TARGET_STATUS_RU.get(code, code or "неизвестно")
@@ -293,7 +303,6 @@ def db_exec(fn):
             return fn(db)
         finally:
             db.close()
-
 
 def log_event(level: str, message: str):
     """Логировать событие через отдельную сессию"""
@@ -1510,18 +1519,26 @@ def _done_sender_ids_for_target(
 
 
 def _precheck_skipped_sender_ids_for_target(db, target_id: int, camp: Optional[Campaign], now: datetime) -> set[int]:
-    q = db.query(Task.account_id).filter(
+    base_q = db.query(Task.account_id).filter(
         Task.target_id == int(target_id),
         Task.task_type == "send_request",
-        Task.last_error.in_(PRECHECK_SKIP_REASONS),
     )
     if camp is not None and bool(camp.daily_repeat_enabled):
+        # Daily repeat:
+        # - accepted/idempotent skips keep lifetime block (friend already exists);
+        # - pending skips are blocked only for current local day (can resolve later).
         day_start_utc, day_end_utc = local_day_bounds_utc_naive(db, now)
-        q = q.filter(
+        q_lifetime = base_q.filter(Task.last_error.in_(PRECHECK_LIFETIME_BLOCK_REASONS))
+        q_pending_today = base_q.filter(
+            Task.last_error.in_(PRECHECK_PENDING_BLOCK_REASONS),
             Task.completed_at >= day_start_utc,
             Task.completed_at < day_end_utc,
         )
-    return {int(x[0]) for x in q.distinct().all()}
+        rows = q_lifetime.union(q_pending_today).distinct().all()
+        return {int(x[0]) for x in rows if x and x[0] is not None}
+
+    q = base_q.filter(Task.last_error.in_(PRECHECK_SKIP_REASONS))
+    return {int(x[0]) for x in q.distinct().all() if x and x[0] is not None}
 
 
 def _pick_replacement_account_for_target(
@@ -5169,6 +5186,30 @@ def show_campaign_progress(chat_id: int, with_campaign_info: bool = False):
         ).all()
         ready_account_ids = [int(a.id) for a in ready_accounts]
         ready_count = len(ready_account_ids)
+        shared_sender_capacity_estimate = 0
+        if target_ids and ready_account_ids:
+            blocked_rows = (
+                db.query(Task.account_id, Task.target_id)
+                .filter(
+                    task_campaign_filter(db, selected_campaign_id),
+                    Task.task_type == "send_request",
+                    Task.account_id.in_(ready_account_ids),
+                    Task.target_id.in_(target_ids),
+                    Task.last_error.in_(PRECHECK_SKIP_REASONS),
+                )
+                .distinct()
+                .all()
+            )
+            blocked_by_sender: dict[int, set[int]] = {}
+            for aid, tid in blocked_rows:
+                if aid is None or tid is None:
+                    continue
+                blocked_by_sender.setdefault(int(aid), set()).add(int(tid))
+            # Sender can cover full layer only if there is no historical precheck block
+            # for any current target in this campaign.
+            shared_sender_capacity_estimate = int(
+                sum(1 for aid in ready_account_ids if len(blocked_by_sender.get(int(aid), set())) == 0)
+            )
         used_sender_rows = (
             db.query(Task.account_id)
             .filter(
@@ -5233,6 +5274,7 @@ def show_campaign_progress(chat_id: int, with_campaign_info: bool = False):
             int(senders_total),
             int(senders_today),
             int(shared_senders_today),
+            int(shared_sender_capacity_estimate),
             int(send_queue),
             int(check_queue),
             int(accepted_today),
@@ -5269,6 +5311,7 @@ def show_campaign_progress(chat_id: int, with_campaign_info: bool = False):
         senders_total,
         senders_today,
         shared_senders_today,
+        shared_sender_capacity_estimate,
         send_queue,
         check_queue,
         accepted_today,
@@ -5348,6 +5391,7 @@ def show_campaign_progress(chat_id: int, with_campaign_info: bool = False):
         f"• Активность сейчас: за 10 мин = {total_send_done_last_10m}, за 30 мин = {total_send_done_last_30m}",
         f"• Уникальных аккаунтов-отправителей сегодня (сделали >=1 DONE): {senders_today}",
         f"• Общих аккаунтов на все ники сегодня (DONE по каждому нику): {shared_senders_today}",
+        f"• Потенциал полного слоя (оценка по истории precheck): {shared_sender_capacity_estimate}",
         f"• Новых заявок отправлено всего: {total_send_done}",
         "",
         "Очередь и проверка:",
