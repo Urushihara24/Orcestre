@@ -1504,18 +1504,34 @@ def _done_sender_ids_for_target(
     now: datetime,
     force_daily_repeat: bool = False,
 ) -> set[int]:
-    """Covered senders for target by actual successful sends only (DONE send_request)."""
+    """
+    Covered senders for target in current planning period.
+
+    Coverage includes:
+    - successful sends (DONE send_request)
+    - precheck/idempotent skips, because they mean sender->target pair is already
+      connected or already has active request and should be treated as covered.
+    """
+    period_daily = (camp is not None and bool(camp.daily_repeat_enabled)) or bool(force_daily_repeat)
+
     send_done_q = db.query(Task.account_id).filter(
         Task.target_id == int(target_id),
         Task.task_type == "send_request",
         Task.status == TaskStatus.DONE.value,
     )
+    precheck_q = db.query(Task.account_id).filter(
+        Task.target_id == int(target_id),
+        Task.task_type == "send_request",
+        Task.last_error.in_(PRECHECK_SKIP_REASONS),
+    )
 
-    if (camp is not None and bool(camp.daily_repeat_enabled)) or bool(force_daily_repeat):
+    if period_daily:
         day_start_utc, day_end_utc = local_day_bounds_utc_naive(db, now)
         send_done_q = send_done_q.filter(Task.completed_at >= day_start_utc, Task.completed_at < day_end_utc)
+        precheck_q = precheck_q.filter(Task.completed_at >= day_start_utc, Task.completed_at < day_end_utc)
 
-    return {int(x[0]) for x in send_done_q.distinct().all()}
+    rows = send_done_q.union(precheck_q).distinct().all()
+    return {int(x[0]) for x in rows if x and x[0] is not None}
 
 
 def _precheck_skipped_sender_ids_for_target(db, target_id: int, camp: Optional[Campaign], now: datetime) -> set[int]:
