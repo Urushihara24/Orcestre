@@ -1,5 +1,4 @@
 # Tools (Dev/Ops)
 
-Эта папка содержит вспомогательные скрипты для администрирования/диагностики.
-Они не нужны для запуска бота в продакшене, но полезны для обслуживания.
-
+This directory contains utility scripts for administration and diagnostics.
+They are not required to run the bot in production, but are useful for maintenance and operational checks.
