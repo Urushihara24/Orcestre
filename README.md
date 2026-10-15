@@ -4,12 +4,14 @@ Telegram bot for managing a pool of Epic Games accounts and sending friend reque
 
 <div align="center">
 
-[![Python](https://img.shields.io/badge/Python-3.x-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org/)
+[![Python](https://img.shields.io/badge/Python-3.11%20%7C%203.12-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org/)
 [![Telegram](https://img.shields.io/badge/Telegram-Bot-26A5E4?style=for-the-badge&logo=telegram&logoColor=white)](https://core.telegram.org/bots)
 [![SQLAlchemy](https://img.shields.io/badge/SQLAlchemy-ORM-D71F00?style=for-the-badge&logo=python&logoColor=white)](https://www.sqlalchemy.org/)
 [![PostgreSQL](https://img.shields.io/badge/PostgreSQL-Database-4169E1?style=for-the-badge&logo=postgresql&logoColor=white)](https://www.postgresql.org/)
 [![Docker](https://img.shields.io/badge/Docker-Compose-2496ED?style=for-the-badge&logo=docker&logoColor=white)](https://www.docker.com/)
 [![pytest](https://img.shields.io/badge/pytest-Tested-0A9EDC?style=for-the-badge&logo=pytest&logoColor=white)](https://pytest.org/)
+[![CI](https://img.shields.io/github/actions/workflow/status/Urushihara24/Orcestre/ci.yml?branch=main&style=for-the-badge&label=CI)](https://github.com/Urushihara24/Orcestre/actions/workflows/ci.yml)
+[![Security](https://img.shields.io/github/actions/workflow/status/Urushihara24/Orcestre/security.yml?branch=main&style=for-the-badge&label=Security)](https://github.com/Urushihara24/Orcestre/actions/workflows/security.yml)
 
 </div>
 
@@ -287,6 +289,13 @@ cd <project-path>
 cd <project-path>
 PYTHONPATH=<project-path> ./.venv/bin/pytest -q
 ```
+
+### Automated quality gates
+
+- full pytest suite on Python 3.11 and 3.12;
+- compile verification of the tracked Python runtime;
+- scheduled and dependency-change `pip-audit` checks;
+- guard against accidentally committed runtime `.env` files.
 
 ## 12. Common problems
 
