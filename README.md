@@ -15,6 +15,20 @@ Telegram bot for managing a pool of Epic Games accounts and sending friend reque
 
 </div>
 
+## Product snapshot
+
+| Area | Capability |
+|---|---|
+| **Account pool** | file import, Epic OAuth authorization and persisted `device_auth` |
+| **Campaign model** | independent targets with recipient lists, sender allocation and per-target settings |
+| **Scheduling** | time windows, jitter, daily repeat, recheck quotas and two allocation algorithms |
+| **Safety** | `DRY_RUN` plus `SEND_REQUESTS_ENABLED` gate outbound friend-request behavior |
+| **State** | PostgreSQL + SQLAlchemy as the source of truth for accounts, targets and task state |
+| **Operations** | Telegram operator UI, diagnostics, queue audit, health checks and Docker Compose deployment |
+| **Quality** | full pytest suite and compile checks on Python 3.11/3.12 plus dependency security audit |
+
+**Start here:** [run locally / Docker](#9-running-the-application) · [diagnostics](#10-diagnostics) · [tests](#11-tests)
+
 ## 1. What the bot does
 
 - imports sender accounts from `.xlsx/.txt/.csv`;
